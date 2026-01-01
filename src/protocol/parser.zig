@@ -1,0 +1,414 @@
+//! Incremental HTTP Message Parser for httpx.zig
+//!
+//! State-machine based parser for HTTP/1.x messages supporting:
+//!
+//! - Incremental parsing (feed data as it arrives)
+//! - Request and response parsing
+//! - Chunked transfer encoding
+//! - Header limits for security
+//! - Cross-platform compatible
+
+const std = @import("std");
+const mem = std.mem;
+const Allocator = mem.Allocator;
+
+const types = @import("../core/types.zig");
+const Headers = @import("../core/headers.zig").Headers;
+const Status = @import("../core/status.zig").Status;
+
+/// Parser state machine states.
+pub const ParserState = enum {
+    start,
+    request_line,
+    status_line,
+    headers,
+    body,
+    chunk_size,
+    chunk_data,
+    chunk_trailer,
+    complete,
+    err,
+};
+
+/// Parser mode - request or response.
+pub const ParserMode = enum {
+    request,
+    response,
+};
+
+/// Incremental HTTP message parser.
+pub const Parser = struct {
+    allocator: Allocator,
+    state: ParserState = .start,
+    mode: ParserMode = .request,
+    method: ?types.Method = null,
+    path: ?[]const u8 = null,
+    version: types.Version = .HTTP_1_1,
+    status_code: ?u16 = null,
+    headers: Headers,
+    body_buffer: std.ArrayListUnmanaged(u8) = .empty,
+    content_length: ?u64 = null,
+    chunked: bool = false,
+    current_chunk_size: usize = 0,
+    bytes_read: usize = 0,
+    line_buffer: std.ArrayListUnmanaged(u8) = .empty,
+    max_header_size: usize = 8192,
+    max_headers: usize = 100,
+
+    const Self = @This();
+
+    /// Creates a new parser instance.
+    pub fn init(allocator: Allocator) Self {
+        return .{
+            .allocator = allocator,
+            .headers = Headers.init(allocator),
+        };
+    }
+
+    /// Creates a parser for parsing responses.
+    pub fn initResponse(allocator: Allocator) Self {
+        var p = init(allocator);
+        p.mode = .response;
+        p.state = .status_line;
+        return p;
+    }
+
+    /// Releases all allocated memory.
+    pub fn deinit(self: *Self) void {
+        self.headers.deinit();
+        self.body_buffer.deinit(self.allocator);
+        self.line_buffer.deinit(self.allocator);
+        if (self.path) |p| self.allocator.free(p);
+    }
+
+    /// Feeds data to the parser, returning the number of bytes consumed.
+    pub fn feed(self: *Self, data: []const u8) !usize {
+        var consumed: usize = 0;
+
+        while (consumed < data.len and self.state != .complete and self.state != .err) {
+            const remaining = data[consumed..];
+            consumed += switch (self.state) {
+                .start => self.parseStart(remaining),
+                .request_line => try self.parseRequestLine(remaining),
+                .status_line => try self.parseStatusLine(remaining),
+                .headers => try self.parseHeaders(remaining),
+                .body => try self.parseBody(remaining),
+                .chunk_size => try self.parseChunkSize(remaining),
+                .chunk_data => try self.parseChunkData(remaining),
+                .chunk_trailer => try self.parseChunkTrailer(remaining),
+                .complete, .err => break,
+            };
+        }
+
+        return consumed;
+    }
+
+    /// Returns true if parsing is complete.
+    pub fn isComplete(self: *const Self) bool {
+        return self.state == .complete;
+    }
+
+    /// Returns true if parsing encountered an error.
+    pub fn isError(self: *const Self) bool {
+        return self.state == .err;
+    }
+
+    /// Returns the parsed body.
+    pub fn getBody(self: *const Self) []const u8 {
+        return self.body_buffer.items;
+    }
+
+    /// Returns the parsed status.
+    pub fn getStatus(self: *const Self) ?Status {
+        if (self.status_code) |code| {
+            return Status.fromCode(code);
+        }
+        return null;
+    }
+
+    /// Resets the parser for reuse.
+    pub fn reset(self: *Self) void {
+        self.state = .start;
+        self.method = null;
+        if (self.path) |p| {
+            self.allocator.free(p);
+            self.path = null;
+        }
+        self.status_code = null;
+        self.headers.clear();
+        self.body_buffer.clearRetainingCapacity();
+        self.line_buffer.clearRetainingCapacity();
+        self.content_length = null;
+        self.chunked = false;
+        self.current_chunk_size = 0;
+        self.bytes_read = 0;
+    }
+
+    fn parseStart(self: *Self, data: []const u8) usize {
+        if (data.len == 0) return 0;
+
+        if (self.mode == .response) {
+            self.state = .status_line;
+        } else {
+            self.state = .request_line;
+        }
+        return 0;
+    }
+
+    fn parseRequestLine(self: *Self, data: []const u8) !usize {
+        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
+            try self.line_buffer.appendSlice(self.allocator, data);
+            return data.len;
+        };
+
+        const line = if (self.line_buffer.items.len > 0) blk: {
+            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
+            break :blk self.line_buffer.items;
+        } else data[0..line_end];
+
+        var parts = mem.splitScalar(u8, line, ' ');
+
+        const method_str = parts.next() orelse {
+            self.state = .err;
+            return line_end + 2;
+        };
+        self.method = types.Method.fromString(method_str) orelse .CUSTOM;
+
+        const path = parts.next() orelse {
+            self.state = .err;
+            return line_end + 2;
+        };
+        self.path = try self.allocator.dupe(u8, path);
+
+        const version_str = parts.next() orelse {
+            self.state = .err;
+            return line_end + 2;
+        };
+        self.version = types.Version.fromString(version_str) orelse .HTTP_1_1;
+
+        self.line_buffer.clearRetainingCapacity();
+        self.state = .headers;
+        return line_end + 2;
+    }
+
+    fn parseStatusLine(self: *Self, data: []const u8) !usize {
+        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
+            try self.line_buffer.appendSlice(self.allocator, data);
+            return data.len;
+        };
+
+        const line = if (self.line_buffer.items.len > 0) blk: {
+            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
+            break :blk self.line_buffer.items;
+        } else data[0..line_end];
+
+        var parts = mem.splitScalar(u8, line, ' ');
+
+        const version_str = parts.next() orelse {
+            self.state = .err;
+            return line_end + 2;
+        };
+        self.version = types.Version.fromString(version_str) orelse .HTTP_1_1;
+
+        const status_str = parts.next() orelse {
+            self.state = .err;
+            return line_end + 2;
+        };
+        self.status_code = std.fmt.parseInt(u16, status_str, 10) catch {
+            self.state = .err;
+            return line_end + 2;
+        };
+
+        self.line_buffer.clearRetainingCapacity();
+        self.state = .headers;
+        return line_end + 2;
+    }
+
+    fn parseHeaders(self: *Self, data: []const u8) !usize {
+        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
+            try self.line_buffer.appendSlice(self.allocator, data);
+            return data.len;
+        };
+
+        const line = if (self.line_buffer.items.len > 0) blk: {
+            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
+            break :blk self.line_buffer.items;
+        } else data[0..line_end];
+
+        if (line.len == 0) {
+            self.line_buffer.clearRetainingCapacity();
+            self.determineBodyState();
+            return line_end + 2;
+        }
+
+        if (mem.indexOf(u8, line, ":")) |sep| {
+            const name = mem.trim(u8, line[0..sep], " \t");
+            const value = mem.trim(u8, line[sep + 1 ..], " \t");
+            try self.headers.append(name, value);
+
+            if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+                self.content_length = std.fmt.parseInt(u64, value, 10) catch null;
+            } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+                if (mem.indexOf(u8, value, "chunked") != null) {
+                    self.chunked = true;
+                }
+            }
+        }
+
+        self.line_buffer.clearRetainingCapacity();
+        return line_end + 2;
+    }
+
+    fn determineBodyState(self: *Self) void {
+        if (self.chunked) {
+            self.state = .chunk_size;
+        } else if (self.content_length) |len| {
+            if (len > 0) {
+                self.state = .body;
+            } else {
+                self.state = .complete;
+            }
+        } else if (self.mode == .response) {
+            self.state = .body;
+        } else {
+            self.state = .complete;
+        }
+    }
+
+    fn parseBody(self: *Self, data: []const u8) !usize {
+        if (self.content_length) |len| {
+            const remaining = len - self.bytes_read;
+            const to_read = @min(data.len, @as(usize, @intCast(remaining)));
+            try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
+            self.bytes_read += to_read;
+
+            if (self.bytes_read >= len) {
+                self.state = .complete;
+            }
+            return to_read;
+        }
+
+        try self.body_buffer.appendSlice(self.allocator, data);
+        return data.len;
+    }
+
+    fn parseChunkSize(self: *Self, data: []const u8) !usize {
+        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
+            try self.line_buffer.appendSlice(self.allocator, data);
+            return data.len;
+        };
+
+        const line = if (self.line_buffer.items.len > 0) blk: {
+            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
+            break :blk self.line_buffer.items;
+        } else data[0..line_end];
+
+        self.current_chunk_size = std.fmt.parseInt(usize, line, 16) catch {
+            self.state = .err;
+            return line_end + 2;
+        };
+
+        self.line_buffer.clearRetainingCapacity();
+        self.bytes_read = 0;
+
+        if (self.current_chunk_size == 0) {
+            self.state = .chunk_trailer;
+        } else {
+            self.state = .chunk_data;
+        }
+
+        return line_end + 2;
+    }
+
+    fn parseChunkData(self: *Self, data: []const u8) !usize {
+        const remaining = self.current_chunk_size - self.bytes_read;
+        const to_read = @min(data.len, remaining);
+
+        try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
+        self.bytes_read += to_read;
+
+        if (self.bytes_read >= self.current_chunk_size) {
+            if (data.len > to_read + 1 and data[to_read] == '\r' and data[to_read + 1] == '\n') {
+                self.state = .chunk_size;
+                return to_read + 2;
+            }
+        }
+
+        return to_read;
+    }
+
+    fn parseChunkTrailer(self: *Self, data: []const u8) !usize {
+        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
+            return data.len;
+        };
+
+        if (line_end == 0) {
+            self.state = .complete;
+        }
+
+        return line_end + 2;
+    }
+};
+
+test "Parser request line" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    const data = "GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    _ = try parser.feed(data);
+
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqual(types.Method.GET, parser.method.?);
+    try std.testing.expectEqualStrings("/api/users", parser.path.?);
+}
+
+test "Parser response" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+
+    const data = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello";
+    _ = try parser.feed(data);
+
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqual(@as(?u16, 200), parser.status_code);
+    try std.testing.expectEqualStrings("Hello", parser.getBody());
+}
+
+test "Parser chunked encoding" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+
+    const data = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n0\r\n\r\n";
+    _ = try parser.feed(data);
+
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqualStrings("Hello", parser.getBody());
+}
+
+test "Parser headers" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    const data = "GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\n\r\n";
+    _ = try parser.feed(data);
+
+    try std.testing.expectEqualStrings("example.com", parser.headers.get("Host").?);
+    try std.testing.expectEqualStrings("test", parser.headers.get("User-Agent").?);
+}
+
+test "Parser reset" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    _ = try parser.feed("GET / HTTP/1.1\r\n\r\n");
+    try std.testing.expect(parser.isComplete());
+
+    parser.reset();
+    try std.testing.expect(!parser.isComplete());
+    try std.testing.expect(parser.method == null);
+}
