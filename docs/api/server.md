@@ -1,6 +1,15 @@
 # Server API
 
-The `httpx.zig` server module provides a robust, Express-inspired HTTP server with middleware support, routing, and proper context handling.
+The `httpx.zig` server module provides a robust, Express-inspired HTTP server with middleware support, routing, and proper context handling. Supports HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3 protocols.
+
+## Protocol Support
+
+| Protocol | Status | Features |
+|----------|--------|----------|
+| HTTP/1.0 | ✅ Full | Basic request/response |
+| HTTP/1.1 | ✅ Full | Keep-Alive, chunked transfer, pipelining |
+| HTTP/2 | ✅ Full | Multiplexing, HPACK, server push, flow control |
+| HTTP/3 | ✅ Full | QUIC transport, QPACK, 0-RTT |
 
 ## Server
 
@@ -18,6 +27,7 @@ defer server.deinit();
 // Initialize with custom config
 var server = httpx.Server.initWithConfig(allocator, .{
     .port = 3000,
+    .host = "0.0.0.0",
     .max_body_size = 1048576, // 1MB
 });
 ```
@@ -32,6 +42,10 @@ var server = httpx.Server.initWithConfig(allocator, .{
 | `request_timeout_ms` | `u64` | `30000` | Timeout for request processing. |
 | `keep_alive` | `bool` | `true` | Enable HTTP Keep-Alive. |
 | `max_connections` | `u32` | `1000` | Max concurrent connections. |
+| `http2_enabled` | `bool` | `false` | Enable HTTP/2 support |
+| `http3_enabled` | `bool` | `false` | Enable HTTP/3 support |
+| `tls_cert_path` | `?[]const u8` | `null` | Path to TLS certificate |
+| `tls_key_path` | `?[]const u8` | `null` | Path to TLS private key |
 
 ### Methods
 
@@ -59,18 +73,58 @@ Adds a middleware to the global stack.
 try server.use(httpx.middleware.logger());
 ```
 
-#### Routing
+### Routing Methods
 
-Methods to register route handlers:
+| Method | Description |
+|--------|-------------|
+| `get(path, handler)` | Register GET route |
+| `post(path, handler)` | Register POST route |
+| `put(path, handler)` | Register PUT route |
+| `delete(path, handler)` | Register DELETE route |
+| `patch(path, handler)` | Register PATCH route |
+| `head(path, handler)` | Register HEAD route |
+| `options(path, handler)` | Register OPTIONS route |
+| `route(method, path, handler)` | Register any method |
 
-- `get(path: []const u8, handler: Handler)`
-- `post(path: []const u8, handler: Handler)`
-- `put(path: []const u8, handler: Handler)`
-- `delete(path: []const u8, handler: Handler)`
-- `patch(path: []const u8, handler: Handler)`
-- `route(method: Method, path: []const u8, handler: Handler)`
+### Quick Example
 
-#### Route Groups
+```zig
+const httpx = @import("httpx");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var server = httpx.Server.init(allocator);
+    defer server.deinit();
+
+    // Add middleware
+    try server.use(httpx.middleware.logger());
+    try server.use(httpx.middleware.cors(.{}));
+
+    // Register routes
+    try server.get("/", homePage);
+    try server.get("/api/users", listUsers);
+    try server.post("/api/users", createUser);
+    try server.get("/api/users/:id", getUser);
+    try server.put("/api/users/:id", updateUser);
+    try server.delete("/api/users/:id", deleteUser);
+
+    std.debug.print("Server listening on http://localhost:8080\n", .{});
+    try server.listen();
+}
+
+fn homePage(ctx: *httpx.Context) !httpx.Response {
+    return ctx.html("<h1>Welcome to httpx.zig!</h1>");
+}
+
+fn listUsers(ctx: *httpx.Context) !httpx.Response {
+    return ctx.json(.{ .users = &.{} });
+}
+```
+
+### Route Groups
 
 Organize routes with a common prefix.
 
@@ -78,12 +132,24 @@ Organize routes with a common prefix.
 var api = server.router.group("/api/v1");
 try api.get("/users", listUsers);
 try api.post("/users", createUser);
+try api.get("/users/:id", getUser);
+try api.put("/users/:id", updateUser);
+try api.delete("/users/:id", deleteUser);
+
+var admin = server.router.group("/admin");
+try admin.use(httpx.middleware.auth());
+try admin.get("/dashboard", adminDashboard);
 ```
 
-#### Custom 404 Handler
+### Custom 404 Handler
 
 ```zig
-server.router.setNotFound(myNotFoundHandler);
+server.router.setNotFound(fn(ctx: *httpx.Context) !httpx.Response {
+    return ctx.status(404).json(.{
+        .error = "Not Found",
+        .path = ctx.request.path,
+    });
+});
 ```
 
 ## Context
@@ -92,36 +158,157 @@ The `Context` struct is passed to every route handler and middleware. It wraps t
 
 ### Fields
 
-- `request`: Pointer to the `Request` object.
-- `response`: `ResponseBuilder` for constructing the reply.
-- `allocator`: Request-scoped allocator.
+| Field | Type | Description |
+|-------|------|-------------|
+| `request` | `*Request` | The incoming request |
+| `response` | `ResponseBuilder` | Response builder |
+| `allocator` | `Allocator` | Request-scoped allocator |
+| `params` | `StringMap` | URL path parameters |
+| `state` | `?*anyopaque` | User-defined state |
 
-### Methods
+### Request Accessors
 
-#### Request Accessors
+| Method | Description |
+|--------|-------------|
+| `param(name)` | Get URL path parameter (`:id`, `:name`) |
+| `query(name)` | Get query string parameter |
+| `header(name)` | Get request header value |
+| `body()` | Get request body |
+| `jsonBody(T)` | Parse body as JSON type T |
 
-- `param(name: []const u8) ?[]const u8`: Get URL path parameter.
-- `query(name: []const u8) ?[]const u8`: Get query parameter.
-- `header(name: []const u8) ?[]const u8`: Get request header.
-
-#### Response Helpers
+### Response Helpers
 
 These methods allow fluent response chaining.
 
-- `status(code: u16) *Context`: Set status code.
-- `setHeader(name: []const u8, value: []const u8) !void`: Set response header.
-- `json(value: anytype) !Response`: Send JSON response.
-- `text(data: []const u8) !Response`: Send plain text response.
-- `html(data: []const u8) !Response`: Send HTML response.
-- `file(path: []const u8) !Response`: Stream a file.
-- `redirect(url: []const u8, code: u16) !Response`: Send redirect.
+| Method | Description |
+|--------|-------------|
+| `status(code)` | Set HTTP status code |
+| `setHeader(name, value)` | Set response header |
+| `json(value)` | Send JSON response |
+| `text(data)` | Send plain text |
+| `html(data)` | Send HTML response |
+| `file(path)` | Stream a file |
+| `redirect(url, code)` | Send redirect |
+| `send(data)` | Send raw bytes |
+| `noContent()` | 204 No Content |
+
+### Example Context Usage
+
+```zig
+fn getUser(ctx: *httpx.Context) !httpx.Response {
+    // Get URL parameter
+    const id = ctx.param("id") orelse return ctx.status(400).json(.{
+        .error = "Missing user ID",
+    });
+    
+    // Get query parameter
+    const format = ctx.query("format") orelse "json";
+    
+    // Get request header
+    const auth = ctx.header("Authorization");
+    
+    // Set response headers
+    try ctx.setHeader("X-Request-Id", "12345");
+    
+    // Return JSON response
+    return ctx.json(.{
+        .id = id,
+        .name = "John Doe",
+        .email = "john@example.com",
+    });
+}
+```
 
 ## Handlers
 
 Handlers are functions that take a `*Context` and return a `!Response`.
 
 ```zig
+const Handler = *const fn (*Context) anyerror!Response;
+
 fn myHandler(ctx: *httpx.Context) !httpx.Response {
     return ctx.json(.{ .message = "Hello World" });
 }
 ```
+
+### Handler Patterns
+
+```zig
+// Simple text response
+fn hello(ctx: *httpx.Context) !httpx.Response {
+    return ctx.text("Hello, World!");
+}
+
+// JSON response with status
+fn created(ctx: *httpx.Context) !httpx.Response {
+    return ctx.status(201).json(.{ .id = 1, .created = true });
+}
+
+// File download
+fn download(ctx: *httpx.Context) !httpx.Response {
+    try ctx.setHeader("Content-Disposition", "attachment; filename=\"report.pdf\"");
+    return ctx.file("/path/to/report.pdf");
+}
+
+// Redirect
+fn redirectHome(ctx: *httpx.Context) !httpx.Response {
+    return ctx.redirect("/", 302);
+}
+
+// Error handling
+fn riskyHandler(ctx: *httpx.Context) !httpx.Response {
+    const data = doSomethingRisky() catch |err| {
+        return ctx.status(500).json(.{
+            .error = "Internal Server Error",
+            .message = @errorName(err),
+        });
+    };
+    return ctx.json(data);
+}
+```
+
+## Static Files
+
+Serve static files from a directory.
+
+```zig
+// Serve files from ./public at /static/*
+try server.static("/static", "./public");
+
+// Or use middleware
+try server.use(httpx.middleware.staticFiles(.{
+    .root = "./public",
+    .prefix = "/static",
+    .index = "index.html",
+    .cache_control = "public, max-age=3600",
+}));
+```
+
+## Error Handling
+
+```zig
+// Global error handler
+server.setErrorHandler(fn(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    std.debug.print("Error: {}\n", .{err});
+    return ctx.status(500).json(.{
+        .error = "Internal Server Error",
+    });
+});
+
+// Per-route error handling
+fn handler(ctx: *httpx.Context) !httpx.Response {
+    const result = riskyOperation() catch |err| switch (err) {
+        error.NotFound => return ctx.status(404).json(.{ .error = "Not Found" }),
+        error.Unauthorized => return ctx.status(401).json(.{ .error = "Unauthorized" }),
+        else => return err,
+    };
+    return ctx.json(result);
+}
+```
+
+## See Also
+
+- [Middleware API](middleware.md) - Built-in middleware
+- [Router API](router.md) - Advanced routing
+- [Protocol API](protocol.md) - HTTP/2, HTTP/3
+- [Server Guide](/guide/getting-started) - Usage guide

@@ -4,6 +4,13 @@ The concurrency module provides tools for parallel execution and task management
 
 ## Functions
 
+These functions are available under `httpx.concurrency.*` and also as top-level helpers:
+
+- `httpx.all`
+- `httpx.any`
+- `httpx.race`
+- `httpx.allSettled`
+
 ### `all`
 
 Executes multiple requests in parallel and waits for all to complete.
@@ -12,9 +19,20 @@ Executes multiple requests in parallel and waits for all to complete.
 pub fn all(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult
 ```
 
+### `allSettled`
+
+Executes multiple requests in parallel and returns a result for **each** request.
+
+- Successful requests are returned as `RequestResult.success`.
+- Failed requests are returned as `RequestResult.err`.
+
+```zig
+pub fn allSettled(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult
+```
+
 ### `any`
 
-Executes multiple requests and returns the first successful response.
+Executes multiple requests and returns the first **successful (2xx)** response.
 
 ```zig
 pub fn any(allocator: Allocator, client: *Client, specs: []const RequestSpec) !?Response

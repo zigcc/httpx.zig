@@ -21,7 +21,7 @@ const config = httpx.ClientConfig{
         .connect_ms = 5000,
         .read_ms = 10000,
     },
-    .http2_enabled = true,
+    .http2_enabled = false,
 };
 var client = httpx.Client.initWithConfig(allocator, config);
 defer client.deinit();

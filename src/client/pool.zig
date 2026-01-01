@@ -14,6 +14,11 @@ const net = std.net;
 const Socket = @import("../net/socket.zig").Socket;
 const address_mod = @import("../net/address.zig");
 
+pub const PoolError = error{
+    PoolExhausted,
+    PoolExhaustedForHost,
+};
+
 /// Pooled connection representing a reusable socket.
 pub const Connection = struct {
     socket: Socket,
@@ -42,8 +47,18 @@ pub const Connection = struct {
     /// Returns true if the connection is healthy and reusable.
     pub fn isHealthy(self: *const Self, max_idle_ms: i64) bool {
         if (self.in_use) return false;
+        if (!self.socket.isValid()) return false;
         const idle_time = std.time.milliTimestamp() - self.last_used;
         return idle_time < max_idle_ms;
+    }
+
+    /// Returns true if this connection should be evicted from the pool.
+    pub fn shouldEvict(self: *const Self, idle_timeout_ms: i64, max_requests_per_connection: u32) bool {
+        if (self.in_use) return false;
+        if (!self.socket.isValid()) return true;
+        if (self.requests_made >= max_requests_per_connection) return true;
+        const idle_time = std.time.milliTimestamp() - self.last_used;
+        return idle_time >= idle_timeout_ms;
     }
 
     /// Closes the underlying socket.
@@ -100,12 +115,20 @@ pub const ConnectionPool = struct {
     pub fn getConnection(self: *Self, host: []const u8, port: u16) !*Connection {
         for (self.connections.items) |*conn| {
             if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
-                if (conn.isHealthy(self.config.idle_timeout_ms)) {
+                if (conn.isHealthy(self.config.idle_timeout_ms) and conn.requests_made < self.config.max_requests_per_connection) {
                     conn.acquire();
                     return conn;
                 }
             }
         }
+
+        if (self.totalCount() >= self.config.max_connections) return PoolError.PoolExhausted;
+
+        var host_count: u32 = 0;
+        for (self.connections.items) |conn| {
+            if (std.mem.eql(u8, conn.host, host) and conn.port == port) host_count += 1;
+        }
+        if (host_count >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
 
         return self.createConnection(host, port);
     }
@@ -115,10 +138,10 @@ pub const ConnectionPool = struct {
         const host_owned = try self.allocator.dupe(u8, host);
         try self.hosts_owned.append(self.allocator, host_owned);
 
-        var socket = try Socket.create();
-        errdefer socket.close();
-
         const addr = try address_mod.resolve(host, port);
+
+        var socket = try Socket.createForAddress(addr);
+        errdefer socket.close();
         try socket.connect(addr);
 
         const now = std.time.milliTimestamp();
@@ -146,7 +169,7 @@ pub const ConnectionPool = struct {
         var i: usize = 0;
         while (i < self.connections.items.len) {
             const conn = &self.connections.items[i];
-            if (!conn.isHealthy(self.config.idle_timeout_ms)) {
+            if (conn.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection)) {
                 conn.close();
                 _ = self.connections.orderedRemove(i);
             } else {
@@ -197,12 +220,13 @@ test "ConnectionPool config" {
 
 test "Connection health check" {
     var conn = Connection{
-        .socket = undefined,
+        .socket = try Socket.create(),
         .host = "localhost",
         .port = 8080,
         .created_at = std.time.milliTimestamp(),
         .last_used = std.time.milliTimestamp(),
     };
+    defer conn.socket.close();
 
     try std.testing.expect(conn.isHealthy(60_000));
 

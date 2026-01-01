@@ -11,6 +11,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
+pub const ExecutorError = error{
+    TaskQueueFull,
+};
+
 /// Task function type.
 pub const TaskFn = *const fn (?*anyopaque) void;
 
@@ -35,6 +39,8 @@ pub const Executor = struct {
     tasks: std.ArrayListUnmanaged(Task) = .empty,
     running: bool = false,
     threads: []Thread = &.{},
+    mutex: Thread.Mutex = .{},
+    cond: Thread.Condition = .{},
 
     const Self = @This();
 
@@ -67,7 +73,15 @@ pub const Executor = struct {
 
     /// Submits a task for execution.
     pub fn submit(self: *Self, task: Task) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.tasks.items.len >= self.config.task_queue_size) {
+            return ExecutorError.TaskQueueFull;
+        }
+
         try self.tasks.append(self.allocator, task);
+        self.cond.signal();
     }
 
     /// Submits a function for execution.
@@ -90,34 +104,54 @@ pub const Executor = struct {
     /// Stops all executor threads.
     pub fn stop(self: *Self) void {
         if (!self.running) return;
+        self.mutex.lock();
         self.running = false;
+        self.cond.broadcast();
+        self.mutex.unlock();
 
-        for (self.threads) |thread| {
-            thread.join();
-        }
+        for (self.threads) |thread| thread.join();
     }
 
     /// Returns the number of pending tasks.
     pub fn pendingCount(self: *const Self) usize {
+        // best-effort snapshot
         return self.tasks.items.len;
     }
 
     /// Runs all tasks synchronously.
     pub fn runAll(self: *Self) void {
-        while (self.tasks.items.len > 0) {
-            const task = self.tasks.orderedRemove(0);
+        while (true) {
+            self.mutex.lock();
+            if (self.tasks.items.len == 0) {
+                self.mutex.unlock();
+                break;
+            }
+            const idx = self.tasks.items.len - 1;
+            const task = self.tasks.items[idx];
+            self.tasks.items.len = idx;
+            self.mutex.unlock();
+
             task.func(task.context);
         }
     }
 
     fn workerLoop(self: *Self) void {
-        while (self.running) {
-            if (self.tasks.items.len > 0) {
-                const task = self.tasks.orderedRemove(0);
-                task.func(task.context);
-            } else {
-                std.time.sleep(1_000_000);
+        while (true) {
+            self.mutex.lock();
+            while (self.running and self.tasks.items.len == 0) {
+                self.cond.wait(&self.mutex);
             }
+            if (!self.running) {
+                self.mutex.unlock();
+                break;
+            }
+
+            const idx = self.tasks.items.len - 1;
+            const task = self.tasks.items[idx];
+            self.tasks.items.len = idx;
+            self.mutex.unlock();
+
+            task.func(task.context);
         }
     }
 };

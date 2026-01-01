@@ -4,7 +4,7 @@ import llmstxt from "vitepress-plugin-llms";
 // Site configuration
 export const SITE_URL = "https://muhammad-fiaz.github.io/httpx.zig";
 export const SITE_NAME = "httpx.zig";
-export const SITE_DESCRIPTION = "Production-ready HTTP client and server library for Zig supporting HTTP/1, HTTP/2, and HTTP/3.";
+export const SITE_DESCRIPTION = "Production-ready HTTP/1.1 client & server library for Zig with TLS (HTTPS), plus HTTP/2 and HTTP/3 framing utilities.";
 
 // Google Analytics and Google Tag Manager IDs
 export const GA_ID = "G-6BVYCRK57P";
@@ -314,6 +314,13 @@ gtag('config', '${GA_ID}');`,
         items: [
           { text: "Routing", link: "/guide/routing" },
           { text: "Middleware", link: "/guide/middleware" },
+        ],
+      },
+      {
+        text: "Protocol",
+        items: [
+          { text: "HTTP/2", link: "/guide/http2" },
+          { text: "HTTP/3", link: "/guide/http3" },
         ],
       },
       {

@@ -3,12 +3,22 @@
 //! A comprehensive HTTP client and server library with support for all
 //! HTTP protocol versions and modern features.
 //!
+//! ## Important Note
+//!
+//! **httpx.zig implements HTTP/2 and HTTP/3 from scratch.** Zig's standard library
+//! does not provide HTTP/2, HTTP/3, or QUIC support. This library contains complete
+//! custom implementations of these protocols:
+//!
+//! - **HTTP/2**: HPACK header compression (RFC 7541), stream multiplexing, flow control (RFC 7540)
+//! - **HTTP/3**: QPACK header compression (RFC 9204), HTTP/3 framing (RFC 9114)
+//! - **QUIC**: Transport framing, packet structures, variable-length integers (RFC 9000)
+//!
 //! ## Supported Protocols
 //!
 //! - **HTTP/1.0**: Basic request-response semantics
 //! - **HTTP/1.1**: Persistent connections, chunked transfer, pipelining
-//! - **HTTP/2**: Binary framing, multiplexing, header compression (HPACK), server push
-//! - **HTTP/3**: QUIC transport, 0-RTT connections, improved multiplexing
+//! - **HTTP/2**: Full implementation with HPACK compression, stream multiplexing, flow control
+//! - **HTTP/3**: QPACK compression, QUIC transport framing support
 //!
 //! ## Platform Support
 //!
@@ -25,7 +35,7 @@
 //! - Redirect following with configurable policies
 //! - Request/response interceptors
 //! - Concurrent request execution
-//! - TLS/SSL support
+//! - TLS/SSL support (HTTPS)
 //! - Timeout configuration
 //! - Cookie handling
 //!
@@ -35,6 +45,12 @@
 //! - Static file serving
 //! - JSON response helpers
 //! - Request context with user data
+//!
+//! ### Protocol Features
+//! - HTTP/2 HPACK header compression (RFC 7541)
+//! - HTTP/2 stream state machine and flow control
+//! - HTTP/3 QPACK header compression (RFC 9204)
+//! - QUIC transport framing (RFC 9000)
 //!
 //! ## Quick Start
 //!
@@ -63,6 +79,10 @@ pub const response = @import("core/response.zig");
 
 pub const http = @import("protocol/http.zig");
 pub const parser = @import("protocol/parser.zig");
+pub const hpack = @import("protocol/hpack.zig");
+pub const stream = @import("protocol/stream.zig");
+pub const qpack = @import("protocol/qpack.zig");
+pub const quic = @import("protocol/quic.zig");
 
 pub const socket = @import("net/socket.zig");
 pub const address = @import("net/address.zig");
@@ -82,6 +102,10 @@ pub const json = @import("util/json.zig");
 
 pub const executor = @import("concurrency/executor.zig");
 pub const concurrency = @import("concurrency/pool.zig");
+
+pub const RequestSpec = concurrency.RequestSpec;
+pub const RequestResult = concurrency.RequestResult;
+pub const BatchBuilder = concurrency.BatchBuilder;
 
 pub const Executor = executor.Executor;
 pub const Task = executor.Task;
@@ -113,6 +137,7 @@ pub const ResponseBuilder = response.ResponseBuilder;
 
 pub const Socket = socket.Socket;
 pub const TcpListener = socket.TcpListener;
+pub const UdpSocket = socket.UdpSocket;
 
 pub const Parser = parser.Parser;
 
@@ -125,6 +150,37 @@ pub const Http3FrameType = http.Http3FrameType;
 pub const Http3ErrorCode = http.Http3ErrorCode;
 pub const AlpnProtocol = http.AlpnProtocol;
 pub const NegotiatedProtocol = http.NegotiatedProtocol;
+
+// HTTP/2 HPACK exports
+pub const HpackContext = hpack.HpackContext;
+pub const HpackStaticTable = hpack.StaticTable;
+pub const HpackDynamicTable = hpack.DynamicTable;
+pub const encodeHpackHeaders = hpack.encodeHeaders;
+pub const decodeHpackHeaders = hpack.decodeHeaders;
+
+// HTTP/2 Stream exports
+pub const Stream = stream.Stream;
+pub const StreamState = stream.StreamState;
+pub const StreamManager = stream.StreamManager;
+pub const StreamPriority = stream.StreamPriority;
+
+// HTTP/3 QPACK exports
+pub const QpackContext = qpack.QpackContext;
+pub const QpackStaticTable = qpack.StaticTable;
+pub const encodeQpackHeaders = qpack.encodeHeaders;
+pub const decodeQpackHeaders = qpack.decodeHeaders;
+
+// QUIC exports
+pub const QuicVersion = quic.Version;
+pub const QuicLongHeader = quic.LongHeader;
+pub const QuicShortHeader = quic.ShortHeader;
+pub const QuicConnectionId = quic.ConnectionId;
+pub const QuicFrameType = quic.FrameType;
+pub const QuicTransportError = quic.TransportError;
+pub const QuicStreamFrame = quic.StreamFrame;
+pub const QuicCryptoFrame = quic.CryptoFrame;
+pub const QuicAckFrame = quic.AckFrame;
+pub const QuicTransportParameters = quic.TransportParameters;
 
 pub const formatRequest = http.formatRequest;
 pub const formatResponse = http.formatResponse;
@@ -170,6 +226,26 @@ pub const PercentEncoding = encoding.PercentEncoding;
 pub const TlsConfig = tls.TlsConfig;
 pub const TlsSession = tls.TlsSession;
 
+/// Executes all requests in parallel and returns a result per request.
+pub fn all(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
+    return concurrency.all(allocator, client, specs);
+}
+
+/// Executes all requests in parallel and returns the first 2xx response (if any).
+pub fn any(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) !?Response {
+    return concurrency.any(allocator, client, specs);
+}
+
+/// Executes all requests in parallel and returns the first completion (success or error).
+pub fn race(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) !RequestResult {
+    return concurrency.race(allocator, client, specs);
+}
+
+/// Executes all requests in parallel and returns a settled result for each one.
+pub fn allSettled(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
+    return concurrency.allSettled(allocator, client, specs);
+}
+
 /// Convenience function to create a GET request.
 pub fn get(allocator: std.mem.Allocator, url: []const u8) !Response {
     var c = Client.init(allocator);
@@ -210,6 +286,22 @@ test "response" {
 
 test "http protocol" {
     _ = http;
+}
+
+test "hpack" {
+    _ = hpack;
+}
+
+test "stream" {
+    _ = stream;
+}
+
+test "qpack" {
+    _ = qpack;
+}
+
+test "quic" {
+    _ = quic;
 }
 
 test "parser" {

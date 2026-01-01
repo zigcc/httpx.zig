@@ -1,14 +1,15 @@
 //! HTTP Protocol Implementation for httpx.zig
 //!
-//! Unified HTTP protocol support for all versions, providing types and logic for:
+//! Unified HTTP protocol support for multiple versions.
 //!
-//! - HTTP/1.0: Basic request-response semantics
-//! - HTTP/1.1: Persistent connections, chunked transfer, pipelining
-//! - HTTP/2: Binary framing, multiplexing, header compression (HPACK)
-//! - HTTP/3: QUIC transport, 0-RTT, improved multiplexing
+//! This module focuses on protocol wire-format framing/types and helpers:
 //!
-//! This module handles the wire-format intricacies of each protocol version,
-//! abstraction of cross-platform networking, and protocol negotiation.
+//! - HTTP/1.x: request/response formatting utilities.
+//! - HTTP/2: frame header + SETTINGS payload helpers, and basic frame IO.
+//! - HTTP/3: QUIC varint + HTTP/3 frame header helpers.
+//!
+//! Full end-to-end HTTP/2 or HTTP/3 stacks (HPACK/QPACK, stream multiplexing,
+//! QUIC transport integration, etc.) are intentionally out of scope here.
 
 const std = @import("std");
 const mem = std.mem;
@@ -338,6 +339,15 @@ pub const Http2Connection = struct {
         max_header_list_size: u32 = 8192,
     };
 
+    pub const Frame = struct {
+        header: Http2FrameHeader,
+        payload: []u8,
+
+        pub fn deinit(self: *Frame, allocator: Allocator) void {
+            allocator.free(self.payload);
+        }
+    };
+
     /// Initializes a new HTTP/2 connection state.
     pub fn init(allocator: Allocator, reader: std.io.AnyReader, writer: std.io.AnyWriter) Self {
         return .{
@@ -355,16 +365,120 @@ pub const Http2Connection = struct {
 
     /// Transmits the local settings to the peer.
     fn sendSettings(self: *Self) !void {
+        var payload = std.ArrayListUnmanaged(u8){};
+        defer payload.deinit(self.allocator);
+
+        try encodeSettingsPayload(self.settings, self.allocator, &payload);
         const header = Http2FrameHeader{
-            .length = 0,
+            .length = @intCast(payload.items.len),
             .frame_type = .settings,
             .flags = 0,
             .stream_id = 0,
         };
         const serialized = header.serialize();
         try self.writer.writeAll(&serialized);
+        if (payload.items.len > 0) {
+            try self.writer.writeAll(payload.items);
+        }
+    }
+
+    pub fn readFrame(self: *Self, allocator: Allocator, max_payload_size: usize) !Frame {
+        var hdr_bytes: [9]u8 = undefined;
+        try self.reader.readNoEof(&hdr_bytes);
+        const header = Http2FrameHeader.parse(hdr_bytes);
+        const len: usize = @intCast(header.length);
+        if (len > max_payload_size) return error.FrameTooLarge;
+
+        const payload = try allocator.alloc(u8, len);
+        errdefer allocator.free(payload);
+        if (len > 0) {
+            try self.reader.readNoEof(payload);
+        }
+        return .{ .header = header, .payload = payload };
+    }
+
+    pub fn writeFrame(self: *Self, header: Http2FrameHeader, payload: []const u8) !void {
+        const serialized = header.serialize();
+        try self.writer.writeAll(&serialized);
+        if (payload.len > 0) {
+            try self.writer.writeAll(payload);
+        }
     }
 };
+
+pub fn encodeSettingsPayload(settings: Http2Connection.Http2ConnectionSettings, allocator: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    // Each setting is 6 bytes: 16-bit ID + 32-bit value.
+    var buf: [6]u8 = undefined;
+
+    // HEADER_TABLE_SIZE (0x1)
+    writeU16BE(&buf, @intFromEnum(Http2Settings.header_table_size));
+    writeU32BE(buf[2..6], settings.header_table_size);
+    try out.appendSlice(allocator, &buf);
+
+    // ENABLE_PUSH (0x2)
+    writeU16BE(&buf, @intFromEnum(Http2Settings.enable_push));
+    writeU32BE(buf[2..6], if (settings.enable_push) 1 else 0);
+    try out.appendSlice(allocator, &buf);
+
+    // MAX_CONCURRENT_STREAMS (0x3)
+    writeU16BE(&buf, @intFromEnum(Http2Settings.max_concurrent_streams));
+    writeU32BE(buf[2..6], settings.max_concurrent_streams);
+    try out.appendSlice(allocator, &buf);
+
+    // INITIAL_WINDOW_SIZE (0x4)
+    writeU16BE(&buf, @intFromEnum(Http2Settings.initial_window_size));
+    writeU32BE(buf[2..6], settings.initial_window_size);
+    try out.appendSlice(allocator, &buf);
+
+    // MAX_FRAME_SIZE (0x5)
+    writeU16BE(&buf, @intFromEnum(Http2Settings.max_frame_size));
+    writeU32BE(buf[2..6], settings.max_frame_size);
+    try out.appendSlice(allocator, &buf);
+
+    // MAX_HEADER_LIST_SIZE (0x6)
+    writeU16BE(&buf, @intFromEnum(Http2Settings.max_header_list_size));
+    writeU32BE(buf[2..6], settings.max_header_list_size);
+    try out.appendSlice(allocator, &buf);
+}
+
+pub fn applySettingsPayload(settings: *Http2Connection.Http2ConnectionSettings, payload: []const u8) !void {
+    if (payload.len % 6 != 0) return error.InvalidSettingsPayload;
+
+    var i: usize = 0;
+    while (i < payload.len) : (i += 6) {
+        const id = readU16BE(payload[i..][0..2]);
+        const value = readU32BE(payload[i..][2..6]);
+
+        switch (@as(Http2Settings, @enumFromInt(id))) {
+            .header_table_size => settings.header_table_size = value,
+            .enable_push => settings.enable_push = (value != 0),
+            .max_concurrent_streams => settings.max_concurrent_streams = value,
+            .initial_window_size => settings.initial_window_size = value,
+            .max_frame_size => settings.max_frame_size = value,
+            .max_header_list_size => settings.max_header_list_size = value,
+        }
+    }
+}
+
+fn writeU16BE(buf: *[6]u8, v: u16) void {
+    buf[0] = @intCast((v >> 8) & 0xFF);
+    buf[1] = @intCast(v & 0xFF);
+}
+
+fn readU16BE(buf: []const u8) u16 {
+    return (@as(u16, buf[0]) << 8) | buf[1];
+}
+
+fn writeU32BE(buf: []u8, v: u32) void {
+    buf[0] = @intCast((v >> 24) & 0xFF);
+    buf[1] = @intCast((v >> 16) & 0xFF);
+    buf[2] = @intCast((v >> 8) & 0xFF);
+    buf[3] = @intCast(v & 0xFF);
+}
+
+fn readU32BE(buf: []const u8) u32 {
+    return (@as(u32, buf[0]) << 24) | (@as(u32, buf[1]) << 16) | (@as(u32, buf[2]) << 8) | buf[3];
+}
 
 /// HTTP/3 frame types as defined in RFC 9114.
 pub const Http3FrameType = enum(u64) {
@@ -455,67 +569,25 @@ pub fn decodeVarInt(data: []const u8) !struct { value: u64, len: usize } {
     return .{ .value = value, .len = len };
 }
 
-/// Manages an HTTP/3 connection over QUIC, handling control streams and QPACK state.
-pub const Http3Connection = struct {
-    allocator: Allocator,
-    quic_session: ?*anyopaque,
-    control_stream_id: ?u64 = null,
-    qpack_encoder_stream_id: ?u64 = null,
-    qpack_decoder_stream_id: ?u64 = null,
-    settings: Http3Settings = .{},
-    peer_settings: Http3Settings = .{},
+/// HTTP/3 frame header (type + length), encoded as two QUIC varints.
+pub const Http3FrameHeader = struct {
+    frame_type: u64,
+    length: u64,
 
-    const Self = @This();
-
-    pub fn init(allocator: Allocator) Self {
-        return .{ .allocator = allocator, .quic_session = null };
+    pub fn encode(self: Http3FrameHeader, out: []u8) !usize {
+        var offset: usize = 0;
+        offset += try encodeVarInt(self.frame_type, out[offset..]);
+        offset += try encodeVarInt(self.length, out[offset..]);
+        return offset;
     }
 
-    pub fn deinit(self: *Self) void {
-        _ = self;
-    }
-
-    /// Initiates the HTTP/3 handshake, opening the unidirectional control stream.
-    pub fn handshake(self: *Self) !void {
-        _ = self;
-        var buf: [64]u8 = undefined;
-        // Stream type 0x00 indicates a Control Stream
-        var offset = try encodeVarInt(0x00, &buf);
-
-        // Settings frame (type 0x04)
-        const frame_type_len = try encodeVarInt(0x04, buf[offset..]);
-        offset += frame_type_len;
-
-        // Empty settings for now (length 0)
-        const len_len = try encodeVarInt(0, buf[offset..]);
-        offset += len_len;
-    }
-
-    /// Serializes headers into a HEADERS frame.
-    /// Note: This is a simplified implementation pending full QPACK support.
-    pub fn formatHeadersFrame(self: *Self, headers: *const Headers, out_buffer: *std.ArrayListUnmanaged(u8)) !void {
-        // Frame Type: HEADERS (0x01)
-        var buf: [16]u8 = undefined;
-        const type_len = try encodeVarInt(0x01, &buf);
-        try out_buffer.appendSlice(self.allocator, buf[0..type_len]);
-
-        const length_index = out_buffer.items.len;
-        // Reserve 1 byte for length (assuming short headers for this mock)
-        try out_buffer.append(self.allocator, 0);
-
-        const payload_start = out_buffer.items.len;
-
-        for (headers.entries.items) |h| {
-            try out_buffer.appendSlice(self.allocator, h.name);
-            try out_buffer.appendSlice(self.allocator, ":");
-            try out_buffer.appendSlice(self.allocator, h.value);
-            try out_buffer.append(self.allocator, '\n');
-        }
-
-        const payload_len = out_buffer.items.len - payload_start;
-        if (payload_len < 64) {
-            out_buffer.items[length_index] = @as(u8, @intCast(payload_len));
-        }
+    pub fn decode(data: []const u8) !struct { header: Http3FrameHeader, len: usize } {
+        const t = try decodeVarInt(data);
+        const l = try decodeVarInt(data[t.len..]);
+        return .{
+            .header = .{ .frame_type = t.value, .length = l.value },
+            .len = t.len + l.len,
+        };
     }
 };
 
@@ -649,4 +721,40 @@ test "VarInt encoding" {
     try std.testing.expectEqual(@as(usize, 4), len);
     decoded = try decodeVarInt(buf[0..len]);
     try std.testing.expectEqual(@as(u64, 494878333), decoded.value);
+}
+
+test "HTTP/2 SETTINGS payload encode/decode" {
+    const allocator = std.testing.allocator;
+
+    const settings_in = Http2Connection.Http2ConnectionSettings{
+        .header_table_size = 4096,
+        .enable_push = false,
+        .max_concurrent_streams = 123,
+        .initial_window_size = 65535,
+        .max_frame_size = 16384,
+        .max_header_list_size = 9000,
+    };
+
+    var payload = std.ArrayListUnmanaged(u8){};
+    defer payload.deinit(allocator);
+    try encodeSettingsPayload(settings_in, allocator, &payload);
+
+    var settings_out = Http2Connection.Http2ConnectionSettings{};
+    try applySettingsPayload(&settings_out, payload.items);
+
+    try std.testing.expectEqual(settings_in.header_table_size, settings_out.header_table_size);
+    try std.testing.expectEqual(settings_in.enable_push, settings_out.enable_push);
+    try std.testing.expectEqual(settings_in.max_concurrent_streams, settings_out.max_concurrent_streams);
+    try std.testing.expectEqual(settings_in.initial_window_size, settings_out.initial_window_size);
+    try std.testing.expectEqual(settings_in.max_frame_size, settings_out.max_frame_size);
+    try std.testing.expectEqual(settings_in.max_header_list_size, settings_out.max_header_list_size);
+}
+
+test "HTTP/3 frame header encode/decode" {
+    var buf: [32]u8 = undefined;
+    const hdr = Http3FrameHeader{ .frame_type = 0x01, .length = 1234 };
+    const n = try hdr.encode(&buf);
+    const decoded = try Http3FrameHeader.decode(buf[0..n]);
+    try std.testing.expectEqual(hdr.frame_type, decoded.header.frame_type);
+    try std.testing.expectEqual(hdr.length, decoded.header.length);
 }

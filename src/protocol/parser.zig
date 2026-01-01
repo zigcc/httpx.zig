@@ -25,6 +25,7 @@ pub const ParserState = enum {
     body,
     chunk_size,
     chunk_data,
+    chunk_crlf,
     chunk_trailer,
     complete,
     err,
@@ -51,9 +52,12 @@ pub const Parser = struct {
     chunked: bool = false,
     current_chunk_size: usize = 0,
     bytes_read: usize = 0,
+    chunk_crlf_read: u2 = 0,
     line_buffer: std.ArrayListUnmanaged(u8) = .empty,
     max_header_size: usize = 8192,
     max_headers: usize = 100,
+    header_bytes: usize = 0,
+    header_count: usize = 0,
 
     const Self = @This();
 
@@ -81,6 +85,17 @@ pub const Parser = struct {
         if (self.path) |p| self.allocator.free(p);
     }
 
+    /// Finalizes parsing when the underlying stream has reached EOF.
+    ///
+    /// For HTTP/1.x responses with neither `Content-Length` nor `Transfer-Encoding: chunked`,
+    /// the body is delimited by connection close. In that case, reaching EOF means the
+    /// message is complete.
+    pub fn finishEof(self: *Self) void {
+        if (self.state == .body and self.mode == .response and self.content_length == null and !self.chunked) {
+            self.state = .complete;
+        }
+    }
+
     /// Feeds data to the parser, returning the number of bytes consumed.
     pub fn feed(self: *Self, data: []const u8) !usize {
         var consumed: usize = 0;
@@ -95,6 +110,7 @@ pub const Parser = struct {
                 .body => try self.parseBody(remaining),
                 .chunk_size => try self.parseChunkSize(remaining),
                 .chunk_data => try self.parseChunkData(remaining),
+                .chunk_crlf => try self.parseChunkCrlf(remaining),
                 .chunk_trailer => try self.parseChunkTrailer(remaining),
                 .complete, .err => break,
             };
@@ -142,6 +158,25 @@ pub const Parser = struct {
         self.chunked = false;
         self.current_chunk_size = 0;
         self.bytes_read = 0;
+        self.chunk_crlf_read = 0;
+        self.header_bytes = 0;
+        self.header_count = 0;
+    }
+
+    fn checkLineBufferLimit(self: *Self) !void {
+        if (self.line_buffer.items.len > self.max_header_size) {
+            self.state = .err;
+            return error.HeaderTooLarge;
+        }
+    }
+
+    fn bumpHeaderBytes(self: *Self, line_len: usize) !void {
+        // Account for CRLF too.
+        self.header_bytes += line_len + 2;
+        if (self.header_bytes > self.max_header_size) {
+            self.state = .err;
+            return error.HeaderTooLarge;
+        }
     }
 
     fn parseStart(self: *Self, data: []const u8) usize {
@@ -158,6 +193,7 @@ pub const Parser = struct {
     fn parseRequestLine(self: *Self, data: []const u8) !usize {
         const line_end = mem.indexOf(u8, data, "\r\n") orelse {
             try self.line_buffer.appendSlice(self.allocator, data);
+            try self.checkLineBufferLimit();
             return data.len;
         };
 
@@ -186,6 +222,8 @@ pub const Parser = struct {
         };
         self.version = types.Version.fromString(version_str) orelse .HTTP_1_1;
 
+        try self.bumpHeaderBytes(line.len);
+
         self.line_buffer.clearRetainingCapacity();
         self.state = .headers;
         return line_end + 2;
@@ -194,6 +232,7 @@ pub const Parser = struct {
     fn parseStatusLine(self: *Self, data: []const u8) !usize {
         const line_end = mem.indexOf(u8, data, "\r\n") orelse {
             try self.line_buffer.appendSlice(self.allocator, data);
+            try self.checkLineBufferLimit();
             return data.len;
         };
 
@@ -219,6 +258,8 @@ pub const Parser = struct {
             return line_end + 2;
         };
 
+        try self.bumpHeaderBytes(line.len);
+
         self.line_buffer.clearRetainingCapacity();
         self.state = .headers;
         return line_end + 2;
@@ -227,6 +268,7 @@ pub const Parser = struct {
     fn parseHeaders(self: *Self, data: []const u8) !usize {
         const line_end = mem.indexOf(u8, data, "\r\n") orelse {
             try self.line_buffer.appendSlice(self.allocator, data);
+            try self.checkLineBufferLimit();
             return data.len;
         };
 
@@ -237,14 +279,22 @@ pub const Parser = struct {
 
         if (line.len == 0) {
             self.line_buffer.clearRetainingCapacity();
+            try self.bumpHeaderBytes(0);
             self.determineBodyState();
             return line_end + 2;
         }
 
+        try self.bumpHeaderBytes(line.len);
+
         if (mem.indexOf(u8, line, ":")) |sep| {
+            if (self.header_count >= self.max_headers) {
+                self.state = .err;
+                return error.TooManyHeaders;
+            }
             const name = mem.trim(u8, line[0..sep], " \t");
             const value = mem.trim(u8, line[sep + 1 ..], " \t");
             try self.headers.append(name, value);
+            self.header_count += 1;
 
             if (std.ascii.eqlIgnoreCase(name, "content-length")) {
                 self.content_length = std.fmt.parseInt(u64, value, 10) catch null;
@@ -295,6 +345,7 @@ pub const Parser = struct {
     fn parseChunkSize(self: *Self, data: []const u8) !usize {
         const line_end = mem.indexOf(u8, data, "\r\n") orelse {
             try self.line_buffer.appendSlice(self.allocator, data);
+            try self.checkLineBufferLimit();
             return data.len;
         };
 
@@ -303,13 +354,19 @@ pub const Parser = struct {
             break :blk self.line_buffer.items;
         } else data[0..line_end];
 
-        self.current_chunk_size = std.fmt.parseInt(usize, line, 16) catch {
+        const size_part = if (mem.indexOfScalar(u8, line, ';')) |semi|
+            mem.trim(u8, line[0..semi], " \t")
+        else
+            mem.trim(u8, line, " \t");
+
+        self.current_chunk_size = std.fmt.parseInt(usize, size_part, 16) catch {
             self.state = .err;
             return line_end + 2;
         };
 
         self.line_buffer.clearRetainingCapacity();
         self.bytes_read = 0;
+        self.chunk_crlf_read = 0;
 
         if (self.current_chunk_size == 0) {
             self.state = .chunk_trailer;
@@ -328,24 +385,61 @@ pub const Parser = struct {
         self.bytes_read += to_read;
 
         if (self.bytes_read >= self.current_chunk_size) {
-            if (data.len > to_read + 1 and data[to_read] == '\r' and data[to_read + 1] == '\n') {
-                self.state = .chunk_size;
-                return to_read + 2;
-            }
+            self.state = .chunk_crlf;
         }
 
         return to_read;
     }
 
+    fn parseChunkCrlf(self: *Self, data: []const u8) !usize {
+        if (data.len == 0) return 0;
+
+        var consumed: usize = 0;
+        while (consumed < data.len and self.chunk_crlf_read < 2) {
+            const b = data[consumed];
+            switch (self.chunk_crlf_read) {
+                0 => if (b != '\r') {
+                    self.state = .err;
+                    return error.InvalidChunkEncoding;
+                },
+                1 => if (b != '\n') {
+                    self.state = .err;
+                    return error.InvalidChunkEncoding;
+                },
+                else => {},
+            }
+            self.chunk_crlf_read += 1;
+            consumed += 1;
+        }
+
+        if (self.chunk_crlf_read == 2) {
+            self.chunk_crlf_read = 0;
+            self.state = .chunk_size;
+        }
+
+        return consumed;
+    }
+
     fn parseChunkTrailer(self: *Self, data: []const u8) !usize {
         const line_end = mem.indexOf(u8, data, "\r\n") orelse {
+            try self.line_buffer.appendSlice(self.allocator, data);
+            try self.checkLineBufferLimit();
             return data.len;
         };
 
-        if (line_end == 0) {
+        const line = if (self.line_buffer.items.len > 0) blk: {
+            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
+            break :blk self.line_buffer.items;
+        } else data[0..line_end];
+
+        // Ignore trailer fields but consume them until the terminating empty line.
+        if (line.len == 0) {
+            self.line_buffer.clearRetainingCapacity();
             self.state = .complete;
+            return line_end + 2;
         }
 
+        self.line_buffer.clearRetainingCapacity();
         return line_end + 2;
     }
 };
@@ -383,6 +477,33 @@ test "Parser chunked encoding" {
 
     const data = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n0\r\n\r\n";
     _ = try parser.feed(data);
+
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqualStrings("Hello", parser.getBody());
+}
+
+test "Parser response body by close (finishEof)" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+
+    const data = "HTTP/1.1 200 OK\r\n\r\nHello";
+    _ = try parser.feed(data);
+    try std.testing.expect(!parser.isComplete());
+    parser.finishEof();
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqualStrings("Hello", parser.getBody());
+}
+
+test "Parser chunked with extension and split CRLF" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+
+    _ = try parser.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+    _ = try parser.feed("5;foo=bar\r\nHel");
+    _ = try parser.feed("lo\r");
+    _ = try parser.feed("\n0\r\n\r\n");
 
     try std.testing.expect(parser.isComplete());
     try std.testing.expectEqualStrings("Hello", parser.getBody());

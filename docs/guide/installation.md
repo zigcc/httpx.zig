@@ -2,7 +2,58 @@
 
 To use `httpx.zig` in your project, you need to add it as a dependency in your `build.zig.zon` file.
 
+## Requirements
+
+- **Zig Version**: 0.15.0 or later (tested on 0.15.2)
+- **Operating System**: Windows, Linux, macOS, or FreeBSD
+
+## Platform Support
+
+httpx.zig supports all major platforms and architectures:
+
+### Operating Systems
+
+| OS | Status | Notes |
+|----|--------|-------|
+| Linux | ✅ Full | All major distributions |
+| Windows | ✅ Full | Windows 10/11, Server 2019+ |
+| macOS | ✅ Full | macOS 11+ (Big Sur and later) |
+| FreeBSD | ✅ Full | FreeBSD 13+ |
+
+### Architectures
+
+| Architecture | Linux | Windows | macOS |
+|--------------|-------|---------|-------|
+| x86_64 (64-bit) | ✅ | ✅ | ✅ |
+| aarch64 (ARM64) | ✅ | ✅ | ✅ |
+| i386 (32-bit) | ✅ | ✅ | ✅ |
+| arm (32-bit) | ✅ | ✅ | ✅ |
+
+::: tip Cross-Compilation
+Zig makes cross-compilation easy. You can build for any supported target from any host:
+```bash
+# Build for Linux ARM64 from Windows
+zig build -Dtarget=aarch64-linux
+
+# Build for Windows from Linux
+zig build -Dtarget=x86_64-windows
+
+# Build for macOS from Linux
+zig build -Dtarget=aarch64-macos
+```
+:::
+
 ## 1. Add Dependency
+
+### Automatic installation (recommended)
+
+Run the following command in your terminal:
+
+```bash
+zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig
+```
+
+### Alternative: fetch from tarball
 
 Run the following command in your terminal to fetch the library:
 

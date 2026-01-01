@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Thread = std.Thread;
 
 const Client = @import("../client/client.zig").Client;
 const Response = @import("../core/response.zig").Response;
@@ -109,37 +110,217 @@ pub fn all(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![
     var results = try allocator.alloc(RequestResult, specs.len);
     errdefer allocator.free(results);
 
-    for (specs, 0..) |spec, i| {
-        results[i] = executeSpec(client, spec);
+    if (specs.len == 0) return results;
+
+    const WorkerCtx = struct {
+        client: *Client,
+        spec: RequestSpec,
+        out: *RequestResult,
+
+        fn run(self: *@This()) void {
+            self.out.* = executeSpec(self.client, self.spec);
+        }
+    };
+
+    var threads = try allocator.alloc(Thread, specs.len);
+    defer allocator.free(threads);
+
+    var ctxs = try allocator.alloc(WorkerCtx, specs.len);
+    defer allocator.free(ctxs);
+
+    var spawned: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < spawned) : (i += 1) {
+            threads[i].join();
+        }
     }
 
+    for (specs, 0..) |spec, i| {
+        ctxs[i] = .{ .client = client, .spec = spec, .out = &results[i] };
+        threads[i] = try Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[i]});
+        spawned += 1;
+    }
+
+    for (threads[0..spawned]) |t| t.join();
+
     return results;
+}
+
+/// Executes all requests and returns results for each one.
+///
+/// Unlike `all`, this never fails due to a request error; request failures are
+/// represented as `RequestResult.err` values.
+pub fn allSettled(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
+    return all(allocator, client, specs);
 }
 
 /// Executes all requests and returns the first successful response.
 pub fn any(allocator: Allocator, client: *Client, specs: []const RequestSpec) !?Response {
     _ = allocator;
 
-    for (specs) |spec| {
-        const result = executeSpec(client, spec);
-        switch (result) {
-            .success => return result.success,
-            .err => continue,
+    if (specs.len == 0) return null;
+
+    // NOTE: This function assumes `client` (and its allocator) are safe to use
+    // concurrently. If you pass a non-thread-safe allocator, behavior is undefined.
+    const WorkerCtx = struct {
+        client: *Client,
+        spec: RequestSpec,
+        winner: *std.atomic.Value(bool),
+        result: *?Response,
+        mutex: *Thread.Mutex,
+        cond: *Thread.Condition,
+        remaining: *std.atomic.Value(usize),
+
+        fn run(self: *@This()) void {
+            var rr = executeSpec(self.client, self.spec);
+            defer rr.deinit();
+
+            if (rr == .success and rr.success.status.isSuccess()) {
+                if (!self.winner.swap(true, .acq_rel)) {
+                    self.mutex.lock();
+                    self.result.* = rr.success;
+                    // transfer ownership to caller
+                    rr = .{ .err = error.UnusedResult };
+                    self.cond.signal();
+                    self.mutex.unlock();
+                }
+            }
+
+            const prev = self.remaining.fetchSub(1, .acq_rel);
+            if (prev == 1) {
+                self.mutex.lock();
+                self.cond.signal();
+                self.mutex.unlock();
+            }
         }
+    };
+
+    var winner = std.atomic.Value(bool).init(false);
+    var remaining = std.atomic.Value(usize).init(specs.len);
+    var mutex = Thread.Mutex{};
+    var cond = Thread.Condition{};
+    var result: ?Response = null;
+
+    var threads = try std.heap.page_allocator.alloc(Thread, specs.len);
+    defer std.heap.page_allocator.free(threads);
+
+    var ctxs = try std.heap.page_allocator.alloc(WorkerCtx, specs.len);
+    defer std.heap.page_allocator.free(ctxs);
+
+    var spawned: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < spawned) : (i += 1) threads[i].join();
+        if (result) |*r| r.deinit();
     }
 
-    return null;
+    for (specs, 0..) |spec, i| {
+        ctxs[i] = .{
+            .client = client,
+            .spec = spec,
+            .winner = &winner,
+            .result = &result,
+            .mutex = &mutex,
+            .cond = &cond,
+            .remaining = &remaining,
+        };
+        threads[i] = try Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[i]});
+        spawned += 1;
+    }
+
+    // Wait until a success is found or all workers complete.
+    mutex.lock();
+    while (!winner.load(.acquire) and remaining.load(.acquire) != 0) {
+        cond.wait(&mutex);
+    }
+    mutex.unlock();
+
+    for (threads[0..spawned]) |t| t.join();
+
+    return result;
 }
 
 /// Executes all requests and returns the first to complete.
 pub fn race(allocator: Allocator, client: *Client, specs: []const RequestSpec) !RequestResult {
     _ = allocator;
 
-    if (specs.len == 0) {
-        return .{ .err = error.NoRequests };
+    if (specs.len == 0) return .{ .err = error.NoRequests };
+
+    const WorkerCtx = struct {
+        client: *Client,
+        spec: RequestSpec,
+        winner: *std.atomic.Value(bool),
+        result: *RequestResult,
+        mutex: *Thread.Mutex,
+        cond: *Thread.Condition,
+        remaining: *std.atomic.Value(usize),
+
+        fn run(self: *@This()) void {
+            var rr = executeSpec(self.client, self.spec);
+
+            if (!self.winner.swap(true, .acq_rel)) {
+                self.mutex.lock();
+                self.result.* = rr;
+                self.cond.signal();
+                self.mutex.unlock();
+                // ownership transferred to caller
+                rr = .{ .err = error.UnusedResult };
+            }
+
+            rr.deinit();
+
+            const prev = self.remaining.fetchSub(1, .acq_rel);
+            if (prev == 1) {
+                self.mutex.lock();
+                self.cond.signal();
+                self.mutex.unlock();
+            }
+        }
+    };
+
+    var winner = std.atomic.Value(bool).init(false);
+    var remaining = std.atomic.Value(usize).init(specs.len);
+    var mutex = Thread.Mutex{};
+    var cond = Thread.Condition{};
+    var result: RequestResult = .{ .err = error.NoRequests };
+
+    var threads = try std.heap.page_allocator.alloc(Thread, specs.len);
+    defer std.heap.page_allocator.free(threads);
+
+    var ctxs = try std.heap.page_allocator.alloc(WorkerCtx, specs.len);
+    defer std.heap.page_allocator.free(ctxs);
+
+    var spawned: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < spawned) : (i += 1) threads[i].join();
+        result.deinit();
     }
 
-    return executeSpec(client, specs[0]);
+    for (specs, 0..) |spec, i| {
+        ctxs[i] = .{
+            .client = client,
+            .spec = spec,
+            .winner = &winner,
+            .result = &result,
+            .mutex = &mutex,
+            .cond = &cond,
+            .remaining = &remaining,
+        };
+        threads[i] = try Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[i]});
+        spawned += 1;
+    }
+
+    mutex.lock();
+    while (!winner.load(.acquire) and remaining.load(.acquire) != 0) {
+        cond.wait(&mutex);
+    }
+    mutex.unlock();
+
+    for (threads[0..spawned]) |t| t.join();
+
+    return result;
 }
 
 fn executeSpec(client: *Client, spec: RequestSpec) RequestResult {
@@ -194,4 +375,14 @@ test "RequestSpec" {
 
     try std.testing.expectEqual(types.Method.POST, spec.method);
     try std.testing.expect(spec.body != null);
+}
+
+test "allSettled empty" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator);
+    defer client.deinit();
+
+    const results = try allSettled(allocator, &client, &.{});
+    defer allocator.free(results);
+    try std.testing.expectEqual(@as(usize, 0), results.len);
 }

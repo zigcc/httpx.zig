@@ -61,8 +61,96 @@ fn parseIp4(str: []const u8) ?[4]u8 {
 
 /// Parses an IPv6 address string.
 fn parseIp6(str: []const u8) ?[16]u8 {
-    _ = str;
-    return null;
+    // Minimal IPv6 parser supporting RFC5952-style hex groups with optional "::" abbreviation.
+    // Zone IDs ("%eth0") are intentionally not supported.
+    if (str.len < 2 or str.len > 39) return null;
+    if (std.mem.indexOfScalar(u8, str, '%') != null) return null;
+
+    // Address cannot start or end with a single ':'
+    if ((str[0] == ':' and str.len > 1 and str[1] != ':') or
+        (str.len >= 2 and str[str.len - 2] != ':' and str[str.len - 1] == ':'))
+    {
+        return null;
+    }
+
+    var groups: [8]u16 = .{0} ** 8;
+    var group_count: usize = 0;
+    var abbreviated_at: ?usize = null;
+
+    var i: usize = 0;
+    while (i < str.len) {
+        if (group_count >= 8) return null;
+
+        // Handle abbreviation
+        if (str[i] == ':') {
+            if (i + 1 < str.len and str[i + 1] == ':') {
+                if (abbreviated_at != null) return null;
+                abbreviated_at = group_count;
+                i += 2;
+                if (i >= str.len) break;
+                continue;
+            }
+            // single ':' separator
+            i += 1;
+            continue;
+        }
+
+        // Parse up to 4 hex digits
+        var value: u16 = 0;
+        var digits: usize = 0;
+        while (i < str.len) : (i += 1) {
+            const c = str[i];
+            if (c == ':') break;
+            const d: u8 = switch (c) {
+                '0'...'9' => c - '0',
+                'a'...'f' => c - 'a' + 10,
+                'A'...'F' => c - 'A' + 10,
+                else => return null,
+            };
+            value = (value << 4) | d;
+            digits += 1;
+            if (digits > 4) return null;
+        }
+        if (digits == 0) return null;
+
+        groups[group_count] = value;
+        group_count += 1;
+
+        if (i < str.len and str[i] == ':') {
+            // Loop will handle separator/abbrev
+        }
+    }
+
+    // Expand abbreviation to 8 groups if present
+    if (group_count != 8) {
+        const at = abbreviated_at orelse return null;
+        const tail = group_count - at;
+
+        // Move tail groups to the end
+        var dst: isize = 7;
+        var src: isize = @intCast(group_count - 1);
+        var moved: usize = 0;
+        while (moved < tail) : (moved += 1) {
+            groups[@intCast(dst)] = groups[@intCast(src)];
+            dst -= 1;
+            src -= 1;
+        }
+        // Zero fill between at and the start of moved tail
+        var z: usize = at;
+        while (z <= @as(usize, @intCast(dst))) : (z += 1) {
+            groups[z] = 0;
+        }
+    } else if (abbreviated_at != null) {
+        // "::" with exactly 8 groups is not valid
+        return null;
+    }
+
+    var out: [16]u8 = undefined;
+    for (groups, 0..) |g, gi| {
+        out[gi * 2] = @intCast(g >> 8);
+        out[gi * 2 + 1] = @intCast(g & 0xff);
+    }
+    return out;
 }
 
 /// Parses a host:port string, returning the host and port separately.
@@ -92,19 +180,7 @@ pub fn parseHostPort(str: []const u8, default_port: u16) !struct { host: []const
 
 /// Formats a network address as a string.
 pub fn formatAddress(addr: net.Address, allocator: Allocator) ![]u8 {
-    return switch (addr.any.family) {
-        std.posix.AF.INET => {
-            const ip4 = addr.in.sa.addr;
-            const bytes = @as(*const [4]u8, @ptrCast(&ip4));
-            return std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}:{d}", .{
-                bytes[0], bytes[1], bytes[2], bytes[3], addr.getPort(),
-            });
-        },
-        std.posix.AF.INET6 => {
-            return std.fmt.allocPrint(allocator, "[::1]:{d}", .{addr.getPort()});
-        },
-        else => error.UnsupportedAddressFamily,
-    };
+    return std.fmt.allocPrint(allocator, "{}", .{addr});
 }
 
 /// Returns true if the string looks like an IP address (not a hostname).
@@ -138,6 +214,22 @@ test "parseHostPort IPv6" {
     const result = try parseHostPort("[::1]:8080", 80);
     try std.testing.expectEqualStrings("::1", result.host);
     try std.testing.expectEqual(@as(u16, 8080), result.port);
+}
+
+test "parseIp6 basic" {
+    const ip = parseIp6("::1");
+    try std.testing.expect(ip != null);
+    try std.testing.expectEqual(@as(u8, 0), ip.?[0]);
+    try std.testing.expectEqual(@as(u8, 1), ip.?[15]);
+}
+
+test "parseIp6 full" {
+    const ip = parseIp6("2001:0db8:0000:0000:0000:0000:0000:0001");
+    try std.testing.expect(ip != null);
+    try std.testing.expectEqual(@as(u8, 0x20), ip.?[0]);
+    try std.testing.expectEqual(@as(u8, 0x01), ip.?[1]);
+    try std.testing.expectEqual(@as(u8, 0x00), ip.?[14]);
+    try std.testing.expectEqual(@as(u8, 0x01), ip.?[15]);
 }
 
 test "parseIp4 valid" {

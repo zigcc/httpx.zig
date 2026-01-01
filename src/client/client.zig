@@ -1,15 +1,10 @@
 //! HTTP Client Implementation for httpx.zig
 //!
-//! Production-ready HTTP client with comprehensive features:
+//! HTTP/1.1 client over TCP with optional TLS (HTTPS).
 //!
-//! - All HTTP versions (1.0, 1.1, 2, 3)
-//! - Connection pooling with keep-alive
-//! - Automatic retry with exponential backoff
-//! - Configurable redirect following
-//! - Request/response interceptors
-//! - Timeout configuration
-//! - TLS/SSL support
-//! - Cross-platform (Linux, Windows, macOS)
+//! Notes:
+//! - HTTP/2 and HTTP/3 types exist in `src/protocol/http.zig`, but this client
+//!   currently speaks HTTP/1.1.
 
 const std = @import("std");
 const mem = std.mem;
@@ -24,9 +19,14 @@ const Request = @import("../core/request.zig").Request;
 const Response = @import("../core/response.zig").Response;
 const Status = @import("../core/status.zig").Status;
 const Socket = @import("../net/socket.zig").Socket;
+const SocketIoReader = @import("../net/socket.zig").SocketIoReader;
+const SocketIoWriter = @import("../net/socket.zig").SocketIoWriter;
 const address_mod = @import("../net/address.zig");
 const http = @import("../protocol/http.zig");
+const Parser = @import("../protocol/parser.zig").Parser;
 const TlsConfig = @import("../tls/tls.zig").TlsConfig;
+const TlsSession = @import("../tls/tls.zig").TlsSession;
+const ConnectionPool = @import("pool.zig").ConnectionPool;
 
 /// HTTP client configuration.
 pub const ClientConfig = struct {
@@ -39,7 +39,7 @@ pub const ClientConfig = struct {
     max_response_size: usize = 100 * 1024 * 1024,
     follow_redirects: bool = true,
     verify_ssl: bool = true,
-    http2_enabled: bool = true,
+    http2_enabled: bool = false,
     http3_enabled: bool = false,
     keep_alive: bool = true,
     pool_max_connections: u32 = 20,
@@ -74,6 +74,7 @@ pub const Client = struct {
     config: ClientConfig,
     interceptors: std.ArrayListUnmanaged(Interceptor) = .empty,
     cookies: std.StringHashMapUnmanaged([]const u8) = .{},
+    pool: ConnectionPool,
 
     const Self = @This();
 
@@ -87,6 +88,10 @@ pub const Client = struct {
         return .{
             .allocator = allocator,
             .config = config,
+            .pool = ConnectionPool.initWithConfig(allocator, .{
+                .max_connections = config.pool_max_connections,
+                .max_per_host = config.pool_max_per_host,
+            }),
         };
     }
 
@@ -99,6 +104,7 @@ pub const Client = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.cookies.deinit(self.allocator);
+        self.pool.deinit();
     }
 
     /// Adds an interceptor to the client.
@@ -108,6 +114,10 @@ pub const Client = struct {
 
     /// Makes an HTTP request.
     pub fn request(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
+        return self.requestInternal(method, url, reqOpts, 0);
+    }
+
+    fn requestInternal(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions, depth: u32) !Response {
         const full_url = if (self.config.base_url) |base|
             try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url })
         else
@@ -155,8 +165,22 @@ pub const Client = struct {
 
         const should_follow = reqOpts.follow_redirects orelse self.config.follow_redirects;
         if (should_follow and response.isRedirect()) {
+            if (depth >= self.config.redirect_policy.max_redirects) {
+                response.deinit();
+                return error.TooManyRedirects;
+            }
+
+            const location = response.headers.get(HeaderName.LOCATION) orelse {
+                response.deinit();
+                return error.InvalidResponse;
+            };
+
+            const next_url = try self.resolveRedirectUrl(req.uri, location);
+            defer self.allocator.free(next_url);
+
+            const next_method = self.config.redirect_policy.getRedirectMethod(response.status.code, req.method);
             response.deinit();
-            return self.followRedirect(&req, response.headers.get(HeaderName.LOCATION), 0);
+            return self.requestInternal(next_method, next_url, reqOpts, depth + 1);
         }
 
         return response;
@@ -164,53 +188,189 @@ pub const Client = struct {
 
     /// Executes the actual HTTP request.
     fn executeRequest(self: *Self, req: *Request) !Response {
+        const policy = self.config.retry_policy;
+        const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
+
+        var attempt: u32 = 0;
+        while (true) {
+            var res = self.executeRequestOnce(req) catch |err| {
+                if (policy.retry_on_connection_error and can_retry_method and attempt < policy.max_retries) {
+                    attempt += 1;
+                    const delay_ms = policy.calculateDelay(attempt);
+                    if (delay_ms > 0) std.time.sleep(delay_ms * std.time.ns_per_ms);
+                    continue;
+                }
+                return err;
+            };
+
+            if (can_retry_method and attempt < policy.max_retries and policy.shouldRetryStatus(res.status.code)) {
+                res.deinit();
+                attempt += 1;
+                const delay_ms = policy.calculateDelay(attempt);
+                if (delay_ms > 0) std.time.sleep(delay_ms * std.time.ns_per_ms);
+                continue;
+            }
+
+            return res;
+        }
+    }
+
+    fn executeRequestOnce(self: *Self, req: *Request) !Response {
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
 
-        var socket = try Socket.create();
-        defer socket.close();
+        const request_data = try http.formatRequest(req, self.allocator);
+        defer self.allocator.free(request_data);
 
-        if (self.config.timeouts.connect_ms > 0) {
-            try socket.setRecvTimeout(self.config.timeouts.read_ms);
-            try socket.setSendTimeout(self.config.timeouts.write_ms);
+        if (req.uri.isTls()) {
+            // TLS pooling requires keeping a live TLS session; not implemented yet.
+            const addr = try address_mod.resolve(host, port);
+
+            var socket = try Socket.createForAddress(addr);
+            defer socket.close();
+
+            if (self.config.timeouts.read_ms > 0) {
+                try socket.setRecvTimeout(self.config.timeouts.read_ms);
+            }
+            if (self.config.timeouts.write_ms > 0) {
+                try socket.setSendTimeout(self.config.timeouts.write_ms);
+            }
+
+            try socket.connect(addr);
+
+            return self.executeTlsHttp(&socket, host, request_data);
+        }
+
+        if (self.config.keep_alive) {
+            var conn = try self.pool.getConnection(host, port);
+            errdefer conn.close();
+            defer self.pool.releaseConnection(conn);
+
+            if (self.config.timeouts.read_ms > 0) {
+                try conn.socket.setRecvTimeout(self.config.timeouts.read_ms);
+            }
+            if (self.config.timeouts.write_ms > 0) {
+                try conn.socket.setSendTimeout(self.config.timeouts.write_ms);
+            }
+            try conn.socket.setKeepAlive(true);
+
+            try conn.socket.sendAll(request_data);
+            var res = try self.readResponseFromTcp(&conn.socket);
+            if (!res.headers.isKeepAlive(.HTTP_1_1)) {
+                conn.close();
+            }
+            return res;
         }
 
         const addr = try address_mod.resolve(host, port);
+
+        var socket = try Socket.createForAddress(addr);
+        defer socket.close();
+
+        if (self.config.timeouts.read_ms > 0) {
+            try socket.setRecvTimeout(self.config.timeouts.read_ms);
+        }
+        if (self.config.timeouts.write_ms > 0) {
+            try socket.setSendTimeout(self.config.timeouts.write_ms);
+        }
+
         try socket.connect(addr);
 
-        const request_data = try http.formatRequest(req, self.allocator);
-        defer self.allocator.free(request_data);
         try socket.sendAll(request_data);
-
-        var conn = http.Http1Connection.init(self.allocator, socket.reader(), socket.writer());
-        _ = &conn;
-
-        var response_buf: [65536]u8 = undefined;
-        var total_read: usize = 0;
-
-        while (total_read < response_buf.len) {
-            const n = try socket.recv(response_buf[total_read..]);
-            if (n == 0) break;
-            total_read += n;
-
-            if (mem.indexOf(u8, response_buf[0..total_read], "\r\n\r\n")) |_| {
-                break;
-            }
-        }
-
-        return parseResponse(self.allocator, response_buf[0..total_read]);
+        return self.readResponseFromTcp(&socket);
     }
 
-    /// Follows a redirect.
-    fn followRedirect(self: *Self, original: *Request, location: ?[]const u8, depth: u32) !Response {
-        if (depth >= self.config.redirect_policy.max_redirects) {
-            return error.TooManyRedirects;
+    fn executeTlsHttp(self: *Self, socket: *Socket, host: []const u8, request_data: []const u8) !Response {
+        const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+
+        var session = TlsSession.init(tls_cfg);
+        defer session.deinit();
+        session.attachSocket(socket);
+        try session.handshake(host);
+
+        const w = try session.getWriter();
+        try w.writeAll(request_data);
+
+        const r = try session.getReader();
+        return self.readResponseFromIo(r);
+    }
+
+    fn readResponseFromTcp(self: *Self, socket: *Socket) !Response {
+        var parser = Parser.initResponse(self.allocator);
+        defer parser.deinit();
+
+        var buf: [16 * 1024]u8 = undefined;
+        while (!parser.isComplete()) {
+            const n = try socket.recv(&buf);
+            if (n == 0) break;
+            _ = try parser.feed(buf[0..n]);
         }
 
-        const redirect_url = location orelse return error.InvalidResponse;
-        const method = self.config.redirect_policy.getRedirectMethod(301, original.method);
+        parser.finishEof();
 
-        return self.request(method, redirect_url, .{});
+        if (!parser.isComplete()) return error.InvalidResponse;
+        return self.responseFromParser(&parser);
+    }
+
+    fn readResponseFromIo(self: *Self, r: *std.Io.Reader) !Response {
+        var parser = Parser.initResponse(self.allocator);
+        defer parser.deinit();
+
+        var buf: [16 * 1024]u8 = undefined;
+        while (!parser.isComplete()) {
+            var iov = [_][]u8{buf[0..]};
+            const n = r.readVec(&iov) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => return err,
+            };
+            if (n == 0) break;
+            _ = try parser.feed(buf[0..n]);
+        }
+
+        parser.finishEof();
+
+        if (!parser.isComplete()) return error.InvalidResponse;
+        return self.responseFromParser(&parser);
+    }
+
+    fn responseFromParser(self: *Self, parser: *Parser) !Response {
+        _ = self;
+        const code = parser.status_code orelse return error.InvalidResponse;
+        var res = Response.init(parser.allocator, code);
+        errdefer res.deinit();
+
+        // Move headers ownership from parser to response.
+        res.headers.deinit();
+        res.headers = parser.headers;
+        parser.headers = Headers.init(parser.allocator);
+
+        if (parser.getBody().len > 0) {
+            res.body = try parser.allocator.dupe(u8, parser.getBody());
+            res.body_owned = true;
+        }
+
+        return res;
+    }
+
+    fn resolveRedirectUrl(self: *Self, base: Uri, location: []const u8) ![]u8 {
+        // Absolute URL.
+        if (mem.indexOf(u8, location, "://") != null) {
+            return self.allocator.dupe(u8, location);
+        }
+
+        const scheme = base.scheme orelse "http";
+        const host = base.host orelse return error.InvalidUri;
+        const port = base.effectivePort();
+
+        if (location.len > 0 and location[0] == '/') {
+            return std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}{s}", .{ scheme, host, port, location });
+        }
+
+        // Relative to current path.
+        const base_path = base.path;
+        const slash = mem.lastIndexOfScalar(u8, base_path, '/') orelse 0;
+        const prefix = base_path[0 .. slash + 1];
+        return std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}{s}{s}", .{ scheme, host, port, prefix, location });
     }
 
     /// GET request convenience method.
@@ -251,36 +411,27 @@ pub const Client = struct {
 
 /// Parses an HTTP response from raw data.
 fn parseResponse(allocator: Allocator, data: []const u8) !Response {
-    const header_end = mem.indexOf(u8, data, "\r\n\r\n") orelse return error.InvalidResponse;
-    const headers_data = data[0..header_end];
-    const body_data = if (header_end + 4 < data.len) data[header_end + 4 ..] else "";
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
 
-    var lines = mem.splitSequence(u8, headers_data, "\r\n");
+    _ = try parser.feed(data);
+    if (!parser.isComplete()) return error.InvalidResponse;
 
-    const status_line = lines.next() orelse return error.InvalidResponse;
-    var status_parts = mem.splitScalar(u8, status_line, ' ');
-    _ = status_parts.next();
-    const status_str = status_parts.next() orelse return error.InvalidResponse;
-    const status_code = try std.fmt.parseInt(u16, status_str, 10);
+    const code = parser.status_code orelse return error.InvalidResponse;
+    var res = Response.init(allocator, code);
+    errdefer res.deinit();
 
-    var response = Response.init(allocator, status_code);
-    errdefer response.deinit();
+    // Move headers ownership from parser to response.
+    res.headers.deinit();
+    res.headers = parser.headers;
+    parser.headers = Headers.init(allocator);
 
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (mem.indexOf(u8, line, ":")) |sep| {
-            const name = mem.trim(u8, line[0..sep], " \t");
-            const value = mem.trim(u8, line[sep + 1 ..], " \t");
-            try response.headers.append(name, value);
-        }
+    if (parser.getBody().len > 0) {
+        res.body = try allocator.dupe(u8, parser.getBody());
+        res.body_owned = true;
     }
 
-    if (body_data.len > 0) {
-        response.body = try allocator.dupe(u8, body_data);
-        response.body_owned = true;
-    }
-
-    return response;
+    return res;
 }
 
 test "Client initialization" {

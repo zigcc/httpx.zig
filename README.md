@@ -31,6 +31,14 @@
 > **This project is currently in active development and considered experimental.**  
 > APIs are subject to change without notice. Use with caution in production environments.
 
+> [!NOTE]
+> **Custom HTTP/2 & HTTP/3 Implementation:** Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support.
+> httpx.zig implements these protocols **entirely from scratch**, including:
+> - **HPACK** header compression (RFC 7541) for HTTP/2
+> - **HTTP/2** stream multiplexing and flow control (RFC 7540)
+> - **QPACK** header compression (RFC 9204) for HTTP/3
+> - **QUIC** transport framing (RFC 9000) for HTTP/3
+
 `httpx.zig` is a comprehensive, high-performance HTTP library designed for building robust networked applications. It features a modern API with support for all major HTTP versions, connection pooling, and express-style server routing.
 
 **⭐️ If you build with `httpx.zig`, make sure to give it a star! ⭐️**
@@ -42,7 +50,9 @@
 
 | Feature | Description |
 |---------|-------------|
-| 🌐 **Protocol Support** | Full support for **HTTP/1.0**, **HTTP/1.1**, **HTTP/2**, and core **HTTP/3** (QUIC). |
+| 🌐 **Protocol Support** | Full support for **HTTP/1.0**, **HTTP/1.1**, **HTTP/2** (with HPACK), and **HTTP/3** (with QPACK/QUIC). |
+| 📦 **Header Compression** | HPACK (RFC 7541) for HTTP/2 and QPACK (RFC 9204) for HTTP/3. |
+| 🔀 **Stream Multiplexing** | HTTP/2 stream state machine with flow control and priority handling. |
 | 🔄 **Connection Pooling** | Automatic reuse of TCP connections with keep-alive and health checking. |
 | 🛣️ **Express-style Routing** | Intuitive server routing with dynamic path parameters and groups. |
 | 📦 **Middleware Stack** | Built-in middleware for CORS, Logging, Rate Limiting, customized Auth, and more. |
@@ -50,10 +60,10 @@
 | 🔌 **Interceptors** | Global hooks to modify requests and responses (e.g., Auth injection). |
 | 🔁 **Smart Retries** | Configurable retry policies with exponential backoff. |
 | 📝 **JSON & HTML** | Helpers for easy JSON serialization and HTML response generation. |
-| 🔒 **TLS/SSL** | Secure connections via typical TLS 1.3 support. |
+| 🔒 **TLS/SSL** | Secure connections via TLS 1.3 support. |
 | 📁 **Static Files** | Efficient static file serving capabilities. |
 | 🛡️ **Security** | Security headers (Helmet) and safe defaults. |
-| 🚦 **No External Deps** | (Mostly) pure Zig implementation for maximum portability and ease of build. |
+| 🚦 **No External Deps** | Pure Zig implementation for maximum portability and ease of build. |
 
 </details>
 
@@ -71,7 +81,7 @@ Before using `httpx.zig`, ensure you have the following:
 | Requirement | Version | Notes |
 |-------------|---------|-------|
 | **Zig** | 0.15.0+ | Download from [ziglang.org](https://ziglang.org/download/) |
-| **Operating System** | Windows 10+, Linux, macOS | Cross-platform networking support |
+| **Operating System** | Windows 10+, Linux, macOS, FreeBSD | Cross-platform networking support |
 
 ---
 
@@ -79,11 +89,30 @@ Before using `httpx.zig`, ensure you have the following:
 
 `httpx.zig` compiles and runs on a wide range of architectures:
 
-| Platform | Architectures | Status |
-|----------|---------------|--------|
-| **Windows** | x86_64, aarch64, x86 | ✅ Full support |
-| **Linux** | x86_64, aarch64, x86 | ✅ Full support |
-| **macOS** | x86_64, aarch64 (Apple Silicon) | ✅ Full support |
+| Platform | x86_64 (64-bit) | aarch64 (ARM64) | i386 (32-bit) | arm (32-bit) |
+|----------|-----------------|-----------------|---------------|--------------|
+| **Linux** | ✅ | ✅ | ✅ | ✅ |
+| **Windows** | ✅ | ✅ | ✅ | ✅ |
+| **macOS** | ✅ | ✅ (Apple Silicon) | ✅ | ✅ |
+| **FreeBSD** | ✅ | ✅ | ✅ | ✅ |
+
+### Cross-Compilation
+
+Zig makes cross-compilation easy. Build for any target from any host:
+
+```bash
+# Build for Linux ARM64 from Windows
+zig build -Dtarget=aarch64-linux
+
+# Build for Windows from Linux  
+zig build -Dtarget=x86_64-windows
+
+# Build for macOS Apple Silicon from Linux
+zig build -Dtarget=aarch64-macos
+
+# Build for 32-bit Windows
+zig build -Dtarget=i386-windows
+```
 
 </details>
 
@@ -202,12 +231,7 @@ Run benchmarks:
 ```bash
 zig build bench
 ```
- 
-Typical results (Intel i9, Windows):
-- Header parsing: ~10,000 ns/op
-- URI parsing: ~40 ns/op
-- HTTP/3 VarInt Encoding: ~10 ns/op
-- Status lookup: ~1 ns/op
+> Note: Benchmark results will vary based on hardware and network conditions.
  
 ## Contributing
  

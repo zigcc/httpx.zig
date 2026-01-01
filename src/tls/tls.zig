@@ -1,20 +1,21 @@
 //! TLS/SSL Support for httpx.zig
 //!
-//! Provides TLS configuration and session management for HTTPS connections.
-//! Supports cross-platform operation on Linux, Windows, and macOS.
+//! Provides TLS configuration and a session wrapper for HTTPS connections.
+//! This module uses Zig's standard library TLS client (`std.crypto.tls.Client`).
 //!
-//! ## Features
+//! ## Notes
 //!
-//! - TLS 1.2 and TLS 1.3 support
-//! - Certificate verification
-//! - Custom CA certificate loading
-//! - Client certificate authentication
-//! - ALPN protocol negotiation (for HTTP/2)
-//! - SNI (Server Name Indication)
+//! - This is a thin wrapper around the stdlib TLS implementation.
+//! - ALPN negotiation is not currently surfaced by `std.crypto.tls.Client` in a
+//!   way this library uses for HTTP/2/HTTP/3 protocol selection.
+//! - The higher-level HTTP client currently speaks HTTP/1.1 over TLS.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
+const Socket = @import("../net/socket.zig").Socket;
+const SocketIoReader = @import("../net/socket.zig").SocketIoReader;
+const SocketIoWriter = @import("../net/socket.zig").SocketIoWriter;
 
 /// Minimum TLS version configuration.
 pub const TlsVersion = enum {
@@ -52,7 +53,8 @@ pub const TlsConfig = struct {
     ca_path: ?[]const u8 = null,
     cert_file: ?[]const u8 = null,
     key_file: ?[]const u8 = null,
-    alpn_protocols: []const []const u8 = &.{ "h2", "http/1.1" },
+    // Reserved for future protocol negotiation plumbing.
+    alpn_protocols: []const []const u8 = &.{"http/1.1"},
     cipher_suites: ?[]const u8 = null,
     server_name: ?[]const u8 = null,
 
@@ -100,6 +102,17 @@ pub const TlsSession = struct {
     negotiated_protocol: ?[]const u8 = null,
     peer_certificate: ?[]const u8 = null,
     connected: bool = false,
+    socket: ?*Socket = null,
+
+    net_read_buf: ?[]u8 = null,
+    net_write_buf: ?[]u8 = null,
+    tls_read_buf: ?[]u8 = null,
+    tls_write_buf: ?[]u8 = null,
+    net_in: ?SocketIoReader = null,
+    net_out: ?SocketIoWriter = null,
+
+    ca_bundle: ?std.crypto.Certificate.Bundle = null,
+    client: ?std.crypto.tls.Client = null,
 
     const Self = @This();
 
@@ -113,27 +126,106 @@ pub const TlsSession = struct {
 
     /// Releases session resources.
     pub fn deinit(self: *Self) void {
-        _ = self;
+        if (self.client != null) {
+            self.client = null;
+        }
+
+        if (self.ca_bundle) |*bundle| {
+            bundle.deinit(self.allocator);
+            self.ca_bundle = null;
+        }
+
+        if (self.net_read_buf) |buf| self.allocator.free(buf);
+        if (self.net_write_buf) |buf| self.allocator.free(buf);
+        if (self.tls_read_buf) |buf| self.allocator.free(buf);
+        if (self.tls_write_buf) |buf| self.allocator.free(buf);
+
+        self.net_read_buf = null;
+        self.net_write_buf = null;
+        self.tls_read_buf = null;
+        self.tls_write_buf = null;
+        self.net_in = null;
+        self.net_out = null;
+    }
+
+    /// Attaches a connected socket that will carry the TLS session.
+    pub fn attachSocket(self: *Self, socket: *Socket) void {
+        self.socket = socket;
     }
 
     /// Performs the TLS handshake.
     pub fn handshake(self: *Self, hostname: []const u8) !void {
-        _ = hostname;
+        const tls = std.crypto.tls;
+        const sock = self.socket orelse return error.MissingTransport;
+
+        // Allocate buffers once per session.
+        if (self.net_read_buf == null) self.net_read_buf = try self.allocator.alloc(u8, 16 * 1024);
+        if (self.net_write_buf == null) self.net_write_buf = try self.allocator.alloc(u8, 16 * 1024);
+
+        const min_tls_buf = tls.Client.min_buffer_len;
+        if (self.tls_read_buf == null) self.tls_read_buf = try self.allocator.alloc(u8, min_tls_buf);
+        if (self.tls_write_buf == null) self.tls_write_buf = try self.allocator.alloc(u8, min_tls_buf);
+
+        const net_in = SocketIoReader.init(sock, self.net_read_buf.?);
+        const net_out = SocketIoWriter.init(sock, self.net_write_buf.?);
+        self.net_in = net_in;
+        self.net_out = net_out;
+
+        const verify = self.config.verify_mode != .none;
+        const verify_host = verify and self.config.verify_hostname;
+
+        // System CA bundle (cross-platform); optional if verification is disabled.
+        if (verify) {
+            var bundle: std.crypto.Certificate.Bundle = .{};
+            errdefer bundle.deinit(self.allocator);
+            try bundle.rescan(self.allocator);
+            self.ca_bundle = bundle;
+        }
+
+        const sni_host = self.config.server_name orelse hostname;
+
+        const client = try tls.Client.init(&self.net_in.?.reader, &self.net_out.?.writer, .{
+            .host = if (verify_host) .{ .explicit = sni_host } else .{ .no_verification = {} },
+            .ca = if (verify) .{ .bundle = self.ca_bundle.? } else .{ .no_verification = {} },
+            .ssl_key_log = null,
+            .allow_truncation_attacks = false,
+            .write_buffer = self.tls_write_buf.?,
+            .read_buffer = self.tls_read_buf.?,
+            .alert = null,
+        });
+
+        self.client = client;
         self.connected = true;
-        self.negotiated_protocol = "http/1.1";
+        self.negotiated_protocol = null;
     }
 
     /// Reads decrypted data from the session.
     pub fn read(self: *Self, buffer: []u8) !usize {
-        _ = self;
-        _ = buffer;
-        return 0;
+        const c = if (self.client) |*c| c else return error.NotConnected;
+        var iov = [_][]u8{buffer};
+        return c.reader.readVec(&iov) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => err,
+        };
     }
 
     /// Writes data to be encrypted and sent.
     pub fn write(self: *Self, data: []const u8) !usize {
-        _ = self;
+        const c = if (self.client) |*c| c else return error.NotConnected;
+        try c.writer.writeAll(data);
         return data.len;
+    }
+
+    /// Returns an I/O reader for decrypted TLS payload.
+    pub fn getReader(self: *Self) !*std.Io.Reader {
+        const c = if (self.client) |*c| c else return error.NotConnected;
+        return &c.reader;
+    }
+
+    /// Returns an I/O writer for TLS-encrypted payload.
+    pub fn getWriter(self: *Self) !*std.Io.Writer {
+        const c = if (self.client) |*c| c else return error.NotConnected;
+        return &c.writer;
     }
 
     /// Returns the negotiated ALPN protocol.
@@ -157,6 +249,7 @@ pub const TlsSession = struct {
     /// Closes the TLS session.
     pub fn close(self: *Self) void {
         self.connected = false;
+        self.client = null;
     }
 };
 
@@ -175,7 +268,6 @@ pub const VerifyResult = enum {
 
 /// Parses a PEM-encoded certificate.
 pub fn parsePemCertificate(allocator: Allocator, pem_data: []const u8) ![]const u8 {
-    _ = allocator;
     const begin_marker = "-----BEGIN CERTIFICATE-----";
     const end_marker = "-----END CERTIFICATE-----";
 
@@ -184,7 +276,23 @@ pub fn parsePemCertificate(allocator: Allocator, pem_data: []const u8) ![]const 
 
     if (end <= start + begin_marker.len) return error.InvalidPem;
 
-    return pem_data[start + begin_marker.len .. end];
+    var base64_block = pem_data[start + begin_marker.len .. end];
+    base64_block = std.mem.trim(u8, base64_block, " \t\r\n");
+
+    // Remove all whitespace/newlines from the base64 body.
+    var compact = std.ArrayList(u8).init(allocator);
+    defer compact.deinit();
+    for (base64_block) |ch| {
+        if (ch == '\r' or ch == '\n' or ch == '\t' or ch == ' ') continue;
+        try compact.append(ch);
+    }
+
+    const decoder = std.base64.standard.Decoder;
+    const out_len = try decoder.calcSizeForSlice(compact.items);
+    const out = try allocator.alloc(u8, out_len);
+    errdefer allocator.free(out);
+    _ = decoder.decode(out, compact.items) catch return error.InvalidPem;
+    return out;
 }
 
 /// Returns the system's default CA certificate path.
@@ -234,4 +342,20 @@ test "System CA path" {
 test "TLS version strings" {
     try std.testing.expectEqualStrings("TLSv1.2", TlsVersion.tls_1_2.toString());
     try std.testing.expectEqualStrings("TLSv1.3", TlsVersion.tls_1_3.toString());
+}
+
+test "parsePemCertificate decodes base64 payload" {
+    const allocator = std.testing.allocator;
+    const pem =
+        "-----BEGIN CERTIFICATE-----\n" ++
+        "AQID\n" ++
+        "-----END CERTIFICATE-----\n";
+
+    const der = try parsePemCertificate(allocator, pem);
+    defer allocator.free(der);
+
+    try std.testing.expectEqual(@as(usize, 3), der.len);
+    try std.testing.expectEqual(@as(u8, 0x01), der[0]);
+    try std.testing.expectEqual(@as(u8, 0x02), der[1]);
+    try std.testing.expectEqual(@as(u8, 0x03), der[2]);
 }
