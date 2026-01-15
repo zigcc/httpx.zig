@@ -55,6 +55,13 @@ pub const HeaderName = struct {
     pub const X_CONTENT_TYPE_OPTIONS = "X-Content-Type-Options";
     pub const X_FRAME_OPTIONS = "X-Frame-Options";
     pub const X_XSS_PROTECTION = "X-XSS-Protection";
+
+    // WebSocket headers (RFC 6455)
+    pub const SEC_WEBSOCKET_KEY = "Sec-WebSocket-Key";
+    pub const SEC_WEBSOCKET_ACCEPT = "Sec-WebSocket-Accept";
+    pub const SEC_WEBSOCKET_VERSION = "Sec-WebSocket-Version";
+    pub const SEC_WEBSOCKET_PROTOCOL = "Sec-WebSocket-Protocol";
+    pub const SEC_WEBSOCKET_EXTENSIONS = "Sec-WebSocket-Extensions";
 };
 
 /// Represents a single HTTP header entry.
