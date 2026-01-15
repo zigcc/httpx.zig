@@ -345,7 +345,11 @@ pub const WebSocketClient = struct {
         }
     }
 
+    /// Size of the stack-allocated send buffer for small messages.
+    const SEND_BUFFER_SIZE = 4096;
+
     /// Sends a frame with the given opcode.
+    /// Uses stack buffer for small messages to avoid allocation.
     fn sendFrame(self: *Self, opcode: ws.Opcode, data: []const u8) !void {
         if (self.state != .open and self.state != .closing) {
             return error.ConnectionNotOpen;
@@ -357,10 +361,19 @@ pub const WebSocketClient = struct {
             .mask = ws.generateMask(), // Client frames must be masked
         };
 
-        const encoded = try ws.encodeFrame(self.allocator, frame, true);
-        defer self.allocator.free(encoded);
+        const encoded_size = ws.calcEncodedFrameSize(data.len, true);
 
-        try self.sendRaw(encoded);
+        // Use stack buffer for small messages to avoid allocation
+        if (encoded_size <= SEND_BUFFER_SIZE) {
+            var stack_buf: [SEND_BUFFER_SIZE]u8 = undefined;
+            const n = try ws.encodeFrameInto(&stack_buf, frame, true);
+            try self.sendRaw(stack_buf[0..n]);
+        } else {
+            // Fall back to heap allocation for large messages
+            const encoded = try ws.encodeFrame(self.allocator, frame, true);
+            defer self.allocator.free(encoded);
+            try self.sendRaw(encoded);
+        }
     }
 
     /// Low-level send (handles TLS vs plain).

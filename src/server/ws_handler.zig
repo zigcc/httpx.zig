@@ -62,6 +62,10 @@ pub const WebSocketConnection = struct {
 
     const Self = @This();
 
+    /// Size of the stack-allocated send buffer for small messages.
+    /// Messages larger than this will require heap allocation.
+    const SEND_BUFFER_SIZE = 4096;
+
     /// Creates a new WebSocket connection from an accepted socket.
     pub fn init(allocator: Allocator, socket: Socket) Self {
         return .{
@@ -90,6 +94,7 @@ pub const WebSocketConnection = struct {
 
     /// Sends a message with the specified opcode.
     /// Server frames are NOT masked (per RFC 6455).
+    /// Uses stack buffer for small messages to avoid allocation.
     pub fn send(self: *Self, data: []const u8, opcode: ws.Opcode) !void {
         if (self.state != .open and self.state != .closing) {
             return error.ConnectionNotOpen;
@@ -101,10 +106,19 @@ pub const WebSocketConnection = struct {
             .mask = null, // Server frames are unmasked
         };
 
-        const encoded = try ws.encodeFrame(self.allocator, frame, false);
-        defer self.allocator.free(encoded);
+        const encoded_size = ws.calcEncodedFrameSize(data.len, false);
 
-        try self.socket.sendAll(encoded);
+        // Use stack buffer for small messages to avoid allocation
+        if (encoded_size <= SEND_BUFFER_SIZE) {
+            var stack_buf: [SEND_BUFFER_SIZE]u8 = undefined;
+            const n = try ws.encodeFrameInto(&stack_buf, frame, false);
+            try self.socket.sendAll(stack_buf[0..n]);
+        } else {
+            // Fall back to heap allocation for large messages
+            const encoded = try ws.encodeFrame(self.allocator, frame, false);
+            defer self.allocator.free(encoded);
+            try self.socket.sendAll(encoded);
+        }
     }
 
     /// Sends a ping frame.

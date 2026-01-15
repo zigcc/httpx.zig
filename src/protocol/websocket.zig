@@ -204,6 +204,87 @@ pub fn generateMask() [4]u8 {
     return mask;
 }
 
+/// Calculates the header size for a frame with given payload length and mask setting.
+pub fn calcFrameHeaderSize(payload_len: usize, masked: bool) usize {
+    var size: usize = 2;
+    if (payload_len > 65535) {
+        size += 8;
+    } else if (payload_len > 125) {
+        size += 2;
+    }
+    if (masked) {
+        size += 4;
+    }
+    return size;
+}
+
+/// Calculates the total encoded size for a frame.
+pub fn calcEncodedFrameSize(payload_len: usize, masked: bool) usize {
+    return calcFrameHeaderSize(payload_len, masked) + payload_len;
+}
+
+/// Encodes a WebSocket frame into a caller-provided buffer.
+/// Returns the number of bytes written.
+/// This avoids allocation overhead when the caller has a reusable buffer.
+pub fn encodeFrameInto(buffer: []u8, frame: Frame, force_mask: bool) !usize {
+    const payload_len = frame.payload.len;
+    const should_mask = force_mask or frame.mask != null;
+    const total_size = calcEncodedFrameSize(payload_len, should_mask);
+
+    if (buffer.len < total_size) {
+        return error.BufferTooSmall;
+    }
+
+    var offset: usize = 0;
+
+    // First byte: FIN + RSV + Opcode
+    buffer[offset] = (@as(u8, if (frame.fin) 1 else 0) << 7) |
+        (@as(u8, if (frame.rsv1) 1 else 0) << 6) |
+        (@as(u8, if (frame.rsv2) 1 else 0) << 5) |
+        (@as(u8, if (frame.rsv3) 1 else 0) << 4) |
+        @intFromEnum(frame.opcode);
+    offset += 1;
+
+    // Second byte: MASK + Payload length
+    const mask_bit: u8 = if (should_mask) 0x80 else 0;
+
+    if (payload_len <= 125) {
+        buffer[offset] = mask_bit | @as(u8, @intCast(payload_len));
+        offset += 1;
+    } else if (payload_len <= 65535) {
+        buffer[offset] = mask_bit | 126;
+        offset += 1;
+        buffer[offset] = @intCast((payload_len >> 8) & 0xFF);
+        buffer[offset + 1] = @intCast(payload_len & 0xFF);
+        offset += 2;
+    } else {
+        buffer[offset] = mask_bit | 127;
+        offset += 1;
+        inline for (0..8) |i| {
+            buffer[offset + i] = @intCast((payload_len >> @intCast(56 - i * 8)) & 0xFF);
+        }
+        offset += 8;
+    }
+
+    // Masking key
+    var mask_key: [4]u8 = undefined;
+    if (should_mask) {
+        mask_key = frame.mask orelse generateMask();
+        @memcpy(buffer[offset .. offset + 4], &mask_key);
+        offset += 4;
+    }
+
+    // Payload
+    @memcpy(buffer[offset .. offset + payload_len], frame.payload);
+
+    // Apply mask if needed
+    if (should_mask) {
+        applyMask(buffer[offset .. offset + payload_len], mask_key);
+    }
+
+    return total_size;
+}
+
 /// Encodes a WebSocket frame into wire format.
 /// Returns the encoded frame data (caller owns the memory).
 pub fn encodeFrame(allocator: Allocator, frame: Frame, force_mask: bool) ![]u8 {
@@ -397,12 +478,17 @@ pub fn parseClosePayload(payload: []const u8) struct { code: CloseCode, reason: 
 pub const FrameReader = struct {
     allocator: Allocator,
     buffer: std.ArrayListUnmanaged(u8) = .empty,
+    /// Read offset into buffer (data before this has been consumed).
+    read_offset: usize = 0,
     max_payload_size: usize = DEFAULT_MAX_PAYLOAD_SIZE,
     /// Accumulated fragments for fragmented messages.
     fragment_buffer: std.ArrayListUnmanaged(u8) = .empty,
     fragment_opcode: ?Opcode = null,
 
     const Self = @This();
+
+    /// Threshold for compacting the buffer (compact when read_offset exceeds this).
+    const COMPACT_THRESHOLD = 4096;
 
     pub fn init(allocator: Allocator) Self {
         return .{ .allocator = allocator };
@@ -415,7 +501,28 @@ pub const FrameReader = struct {
 
     /// Feeds data into the reader buffer.
     pub fn feed(self: *Self, data: []const u8) !void {
+        // Compact buffer if read_offset is large enough to avoid unbounded growth
+        if (self.read_offset >= COMPACT_THRESHOLD) {
+            self.compact();
+        }
         try self.buffer.appendSlice(self.allocator, data);
+    }
+
+    /// Returns the unread portion of the buffer.
+    inline fn unreadData(self: *const Self) []const u8 {
+        return self.buffer.items[self.read_offset..];
+    }
+
+    /// Compacts the buffer by removing consumed data.
+    fn compact(self: *Self) void {
+        if (self.read_offset == 0) return;
+
+        const remaining = self.buffer.items.len - self.read_offset;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, self.buffer.items[0..remaining], self.buffer.items[self.read_offset..]);
+        }
+        self.buffer.shrinkRetainingCapacity(remaining);
+        self.read_offset = 0;
     }
 
     /// Attempts to read a complete message (handling fragmentation).
@@ -424,14 +531,10 @@ pub const FrameReader = struct {
     /// For data frames, accumulates fragments until FIN is set.
     pub fn readMessage(self: *Self) !?struct { opcode: Opcode, payload: []u8 } {
         while (true) {
-            const result = try decodeFrame(self.allocator, self.buffer.items, self.max_payload_size) orelse return null;
+            const result = try decodeFrame(self.allocator, self.unreadData(), self.max_payload_size) orelse return null;
 
-            // Remove consumed bytes from buffer
-            const remaining = self.buffer.items.len - result.bytes_consumed;
-            if (remaining > 0) {
-                std.mem.copyForwards(u8, self.buffer.items[0..remaining], self.buffer.items[result.bytes_consumed..]);
-            }
-            self.buffer.shrinkRetainingCapacity(remaining);
+            // Advance read offset instead of copying every time
+            self.read_offset += result.bytes_consumed;
 
             const frame = result.frame;
 
@@ -552,6 +655,39 @@ test "encodeFrame medium payload (126-65535 bytes)" {
     try std.testing.expectEqual(@as(u8, 126), encoded[1]); // Extended length indicator
     try std.testing.expectEqual(@as(u8, 0), encoded[2]); // Length high byte
     try std.testing.expectEqual(@as(u8, 200), encoded[3]); // Length low byte
+}
+
+test "calcEncodedFrameSize" {
+    // Small payload, no mask: 2 byte header + payload
+    try std.testing.expectEqual(@as(usize, 7), calcEncodedFrameSize(5, false));
+    // Small payload, with mask: 2 byte header + 4 byte mask + payload
+    try std.testing.expectEqual(@as(usize, 11), calcEncodedFrameSize(5, true));
+    // Medium payload (126 bytes), no mask: 2 + 2 + payload
+    try std.testing.expectEqual(@as(usize, 130), calcEncodedFrameSize(126, false));
+    // Large payload (70000 bytes), no mask: 2 + 8 + payload
+    try std.testing.expectEqual(@as(usize, 70010), calcEncodedFrameSize(70000, false));
+}
+
+test "encodeFrameInto matches encodeFrame" {
+    const allocator = std.testing.allocator;
+    const frame = Frame{ .opcode = .text, .payload = "Hello, World!" };
+
+    // Encode with encodeFrame
+    const encoded_alloc = try encodeFrame(allocator, frame, false);
+    defer allocator.free(encoded_alloc);
+
+    // Encode with encodeFrameInto
+    var buffer: [256]u8 = undefined;
+    const n = try encodeFrameInto(&buffer, frame, false);
+
+    try std.testing.expectEqualSlices(u8, encoded_alloc, buffer[0..n]);
+}
+
+test "encodeFrameInto buffer too small" {
+    const frame = Frame{ .opcode = .text, .payload = "Hello" };
+    var small_buffer: [4]u8 = undefined; // Too small for header + payload
+    const result = encodeFrameInto(&small_buffer, frame, false);
+    try std.testing.expectError(error.BufferTooSmall, result);
 }
 
 test "decodeFrame small payload" {
@@ -718,6 +854,118 @@ test "FrameReader returns control frames immediately" {
     try std.testing.expectEqual(Opcode.ping, msg.?.opcode);
     try std.testing.expectEqualStrings("ping", msg.?.payload);
     allocator.free(msg.?.payload);
+}
+
+test "FrameReader delayed compaction" {
+    const allocator = std.testing.allocator;
+    var reader = FrameReader.init(allocator);
+    defer reader.deinit();
+
+    // Feed multiple small frames and read them
+    // Verify read_offset advances instead of copying on each read
+    const frame1 = [_]u8{ 0x81, 0x02, 'H', 'i' }; // text "Hi"
+    const frame2 = [_]u8{ 0x81, 0x02, 'O', 'k' }; // text "Ok"
+
+    try reader.feed(&frame1);
+    try reader.feed(&frame2);
+
+    // Initial state
+    try std.testing.expectEqual(@as(usize, 0), reader.read_offset);
+    try std.testing.expectEqual(@as(usize, 8), reader.buffer.items.len);
+
+    // Read first message - should advance read_offset, not compact
+    const msg1 = try reader.readMessage();
+    try std.testing.expect(msg1 != null);
+    try std.testing.expectEqualStrings("Hi", msg1.?.payload);
+    allocator.free(msg1.?.payload);
+
+    // read_offset should have advanced
+    try std.testing.expectEqual(@as(usize, 4), reader.read_offset);
+    // Buffer should still be same size (no compaction yet)
+    try std.testing.expectEqual(@as(usize, 8), reader.buffer.items.len);
+
+    // Read second message
+    const msg2 = try reader.readMessage();
+    try std.testing.expect(msg2 != null);
+    try std.testing.expectEqualStrings("Ok", msg2.?.payload);
+    allocator.free(msg2.?.payload);
+
+    try std.testing.expectEqual(@as(usize, 8), reader.read_offset);
+}
+
+test "FrameReader compacts at threshold" {
+    const allocator = std.testing.allocator;
+    var reader = FrameReader.init(allocator);
+    defer reader.deinit();
+
+    // Create a large payload to exceed COMPACT_THRESHOLD (4096)
+    // Need payload + header > 4096, so use 4100 bytes
+    const large_payload = try allocator.alloc(u8, 4100);
+    defer allocator.free(large_payload);
+    @memset(large_payload, 'X');
+
+    const frame = Frame{ .opcode = .binary, .payload = large_payload };
+    const encoded = try encodeFrame(allocator, frame, false);
+    defer allocator.free(encoded);
+
+    // Feed and read to advance read_offset
+    try reader.feed(encoded);
+    const msg1 = try reader.readMessage();
+    try std.testing.expect(msg1 != null);
+    allocator.free(msg1.?.payload);
+
+    // read_offset should be >= COMPACT_THRESHOLD (4096)
+    try std.testing.expect(reader.read_offset >= FrameReader.COMPACT_THRESHOLD);
+
+    // Feed more data - this should trigger compaction
+    const small_frame = [_]u8{ 0x81, 0x02, 'O', 'k' };
+    try reader.feed(&small_frame);
+
+    // After compaction, read_offset should be reset to 0
+    try std.testing.expectEqual(@as(usize, 0), reader.read_offset);
+    // Buffer should only contain the new small frame
+    try std.testing.expectEqual(@as(usize, 4), reader.buffer.items.len);
+
+    // Should still be able to read the new frame
+    const msg2 = try reader.readMessage();
+    try std.testing.expect(msg2 != null);
+    try std.testing.expectEqualStrings("Ok", msg2.?.payload);
+    allocator.free(msg2.?.payload);
+}
+
+test "FrameReader multiple messages without compaction" {
+    const allocator = std.testing.allocator;
+    var reader = FrameReader.init(allocator);
+    defer reader.deinit();
+
+    // Feed 10 small frames at once
+    var all_frames: [100]u8 = undefined;
+    var offset: usize = 0;
+    for (0..10) |i| {
+        all_frames[offset] = 0x81; // FIN + text
+        all_frames[offset + 1] = 0x05; // length 5
+        all_frames[offset + 2] = 'M';
+        all_frames[offset + 3] = 's';
+        all_frames[offset + 4] = 'g';
+        all_frames[offset + 5] = '0' + @as(u8, @intCast(i));
+        all_frames[offset + 6] = '!';
+        offset += 7;
+    }
+
+    try reader.feed(all_frames[0..offset]);
+
+    // Read all 10 messages
+    for (0..10) |i| {
+        const msg = try reader.readMessage();
+        try std.testing.expect(msg != null);
+        try std.testing.expectEqual(@as(usize, 5), msg.?.payload.len);
+        try std.testing.expectEqual(@as(u8, '0' + @as(u8, @intCast(i))), msg.?.payload[3]);
+        allocator.free(msg.?.payload);
+    }
+
+    // No more messages
+    const msg_none = try reader.readMessage();
+    try std.testing.expect(msg_none == null);
 }
 
 test "Frame convenience constructors" {
