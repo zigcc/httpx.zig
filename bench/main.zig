@@ -99,10 +99,78 @@ fn benchVarIntEncoding() void {
     _ = httpx.http.encodeVarInt(494878333, &buf) catch 0;
 }
 
+// WebSocket benchmarks
+var ws_small_payload: [64]u8 = undefined;
+var ws_medium_payload: [1024]u8 = undefined;
+var ws_large_payload: [16384]u8 = undefined;
+var ws_encode_buffer: [32768]u8 = undefined;
+var ws_encoded_small: []u8 = undefined;
+var ws_encoded_medium: []u8 = undefined;
+
+fn benchWsEncodeSmall() void {
+    const frame = httpx.WsFrame{ .opcode = .text, .payload = &ws_small_payload };
+    _ = httpx.websocket.encodeFrameInto(&ws_encode_buffer, frame, false) catch 0;
+}
+
+fn benchWsEncodeMedium() void {
+    const frame = httpx.WsFrame{ .opcode = .binary, .payload = &ws_medium_payload };
+    _ = httpx.websocket.encodeFrameInto(&ws_encode_buffer, frame, false) catch 0;
+}
+
+fn benchWsEncodeLarge() void {
+    const frame = httpx.WsFrame{ .opcode = .binary, .payload = &ws_large_payload };
+    _ = httpx.websocket.encodeFrameInto(&ws_encode_buffer, frame, false) catch 0;
+}
+
+fn benchWsEncodeMasked() void {
+    const frame = httpx.WsFrame{
+        .opcode = .text,
+        .payload = &ws_small_payload,
+        .mask = .{ 0x12, 0x34, 0x56, 0x78 },
+    };
+    _ = httpx.websocket.encodeFrameInto(&ws_encode_buffer, frame, true) catch 0;
+}
+
+fn benchWsDecodeSmall() void {
+    _ = httpx.websocket.decodeFrame(bench_allocator, ws_encoded_small, 1024 * 1024) catch null;
+}
+
+fn benchWsDecodeMedium() void {
+    _ = httpx.websocket.decodeFrame(bench_allocator, ws_encoded_medium, 1024 * 1024) catch null;
+}
+
+fn benchWsMask() void {
+    var data: [1024]u8 = undefined;
+    @memcpy(&data, &ws_medium_payload);
+    httpx.websocket.applyMask(&data, .{ 0x12, 0x34, 0x56, 0x78 });
+}
+
+fn benchWsComputeAccept() void {
+    _ = httpx.websocket.computeAccept("dGhlIHNhbXBsZSBub25jZQ==");
+}
+
+fn benchWsGenerateKey() void {
+    _ = httpx.websocket.generateKey();
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     bench_allocator = gpa.allocator();
+
+    // Initialize WebSocket test data
+    @memset(&ws_small_payload, 'A');
+    @memset(&ws_medium_payload, 'B');
+    @memset(&ws_large_payload, 'C');
+
+    // Pre-encode frames for decode benchmarks
+    const small_frame = httpx.WsFrame{ .opcode = .text, .payload = &ws_small_payload };
+    ws_encoded_small = httpx.websocket.encodeFrame(bench_allocator, small_frame, false) catch &.{};
+    defer bench_allocator.free(ws_encoded_small);
+
+    const medium_frame = httpx.WsFrame{ .opcode = .binary, .payload = &ws_medium_payload };
+    ws_encoded_medium = httpx.websocket.encodeFrame(bench_allocator, medium_frame, false) catch &.{};
+    defer bench_allocator.free(ws_encoded_medium);
 
     std.debug.print("=== httpx.zig Benchmarks ===\n\n", .{});
 
@@ -122,6 +190,17 @@ pub fn main() !void {
     std.debug.print("\nHTTP/2 & HTTP/3:\n", .{});
     benchmark("h2_frame_header", 1_000_000, benchHttp2FrameHeader);
     benchmark("h3_varint_encode", 10_000_000, benchVarIntEncoding);
+
+    std.debug.print("\nWebSocket:\n", .{});
+    benchmark("ws_encode_small_64B", 1_000_000, benchWsEncodeSmall);
+    benchmark("ws_encode_medium_1KB", 500_000, benchWsEncodeMedium);
+    benchmark("ws_encode_large_16KB", 100_000, benchWsEncodeLarge);
+    benchmark("ws_encode_masked_64B", 1_000_000, benchWsEncodeMasked);
+    benchmark("ws_decode_small_64B", 1_000_000, benchWsDecodeSmall);
+    benchmark("ws_decode_medium_1KB", 500_000, benchWsDecodeMedium);
+    benchmark("ws_mask_1KB", 1_000_000, benchWsMask);
+    benchmark("ws_compute_accept", 1_000_000, benchWsComputeAccept);
+    benchmark("ws_generate_key", 1_000_000, benchWsGenerateKey);
 
     std.debug.print("\n=== Benchmark Complete ===\n", .{});
 }
