@@ -38,7 +38,12 @@ const TlsSession = @import("../tls/tls.zig").TlsSession;
 const address_mod = @import("../net/address.zig");
 
 /// WebSocket client error type.
-pub const WebSocketError = HttpError || Allocator.Error || std.posix.ConnectError || std.posix.SetSockOptError || std.posix.SendError || std.posix.RecvError || ws.FrameError;
+pub const WebSocketError = HttpError || Allocator.Error || std.posix.ConnectError || std.posix.SetSockOptError || std.posix.SendError || std.posix.RecvError || ws.FrameError || error{CrlfInjection};
+
+/// Checks if a string contains CRLF sequences that could enable header injection.
+fn containsCrlf(s: []const u8) bool {
+    return mem.indexOf(u8, s, "\r") != null or mem.indexOf(u8, s, "\n") != null;
+}
 
 /// WebSocket client connection state.
 pub const ConnectionState = enum {
@@ -181,6 +186,22 @@ pub const WebSocketClient = struct {
     fn performHandshake(self: *Self, uri: Uri, host: []const u8) WebSocketError!void {
         const key = ws.generateKey();
 
+        // Validate inputs against CRLF injection
+        const path = if (uri.path.len > 0) uri.path else "/";
+        if (containsCrlf(path)) return error.CrlfInjection;
+        if (uri.query) |q| {
+            if (containsCrlf(q)) return error.CrlfInjection;
+        }
+        if (containsCrlf(host)) return error.CrlfInjection;
+        if (self.options.protocols) |protocols| {
+            if (containsCrlf(protocols)) return error.CrlfInjection;
+        }
+        if (self.options.headers) |headers| {
+            for (headers) |h| {
+                if (containsCrlf(h[0]) or containsCrlf(h[1])) return error.CrlfInjection;
+            }
+        }
+
         // Build HTTP upgrade request
         var request_buf = std.ArrayListUnmanaged(u8){};
         defer request_buf.deinit(self.allocator);
@@ -188,7 +209,6 @@ pub const WebSocketClient = struct {
         const writer = request_buf.writer(self.allocator);
 
         // Request line
-        const path = if (uri.path.len > 0) uri.path else "/";
         try writer.print("GET {s}", .{path});
         if (uri.query) |q| {
             try writer.print("?{s}", .{q});
@@ -222,6 +242,7 @@ pub const WebSocketClient = struct {
         // Read response
         var response_buf: [4096]u8 = undefined;
         var response_len: usize = 0;
+        var headers_complete = false;
 
         while (response_len < response_buf.len) {
             const n = try self.recvRaw(response_buf[response_len..]);
@@ -230,8 +251,14 @@ pub const WebSocketClient = struct {
 
             // Check for end of headers
             if (mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n")) |_| {
+                headers_complete = true;
                 break;
             }
+        }
+
+        // Check if buffer filled up without finding header end
+        if (!headers_complete) {
+            return HttpError.HeaderTooLarge;
         }
 
         // Parse response

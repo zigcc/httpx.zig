@@ -43,6 +43,19 @@ pub const Opcode = enum(u4) {
     pub fn isData(self: Opcode) bool {
         return @intFromEnum(self) <= 0x2;
     }
+
+    /// Safely converts a u4 to Opcode, returning null for reserved/invalid values.
+    pub fn fromInt(val: u4) ?Opcode {
+        return switch (val) {
+            0x0 => .continuation,
+            0x1 => .text,
+            0x2 => .binary,
+            0x8 => .close,
+            0x9 => .ping,
+            0xA => .pong,
+            else => null, // Reserved opcodes 0x3-0x7, 0xB-0xF
+        };
+    }
 };
 
 /// WebSocket close status codes as defined in RFC 6455 Section 7.4.1.
@@ -80,9 +93,29 @@ pub const CloseCode = enum(u16) {
         };
     }
 
-    pub fn fromBytes(bytes: [2]u8) CloseCode {
+    /// Safely converts bytes to CloseCode, returning null for invalid/reserved values.
+    pub fn fromBytes(bytes: [2]u8) ?CloseCode {
         const val = (@as(u16, bytes[0]) << 8) | bytes[1];
-        return @enumFromInt(val);
+        return switch (val) {
+            1000 => .normal,
+            1001 => .going_away,
+            1002 => .protocol_error,
+            1003 => .unsupported_data,
+            1005 => .no_status,
+            1006 => .abnormal,
+            1007 => .invalid_payload,
+            1008 => .policy_violation,
+            1009 => .message_too_big,
+            1010 => .missing_extension,
+            1011 => .internal_error,
+            1015 => .tls_handshake,
+            else => null, // Unknown/reserved close codes
+        };
+    }
+
+    /// Converts bytes to CloseCode, using protocol_error for invalid values.
+    pub fn fromBytesOrDefault(bytes: [2]u8) CloseCode {
+        return fromBytes(bytes) orelse .protocol_error;
     }
 };
 
@@ -378,7 +411,7 @@ pub fn decodeFrame(allocator: Allocator, data: []const u8, max_payload_size: usi
     const rsv1 = (byte0 & 0x40) != 0;
     const rsv2 = (byte0 & 0x20) != 0;
     const rsv3 = (byte0 & 0x10) != 0;
-    const opcode: Opcode = @enumFromInt(byte0 & 0x0F);
+    const opcode = Opcode.fromInt(@truncate(byte0 & 0x0F)) orelse return error.InvalidOpcode;
     offset += 1;
 
     // Second byte
@@ -470,7 +503,8 @@ pub fn parseClosePayload(payload: []const u8) struct { code: CloseCode, reason: 
         return .{ .code = .no_status, .reason = "" };
     }
 
-    const code = CloseCode.fromBytes(payload[0..2].*);
+    // Use fromBytesOrDefault to safely handle unknown close codes
+    const code = CloseCode.fromBytesOrDefault(payload[0..2].*);
     const reason = if (payload.len > 2) payload[2..] else "";
 
     return .{ .code = code, .reason = reason };
@@ -483,6 +517,8 @@ pub const FrameReader = struct {
     /// Read offset into buffer (data before this has been consumed).
     read_offset: usize = 0,
     max_payload_size: usize = DEFAULT_MAX_PAYLOAD_SIZE,
+    /// Maximum total size for fragmented messages (prevents DoS via infinite fragments).
+    max_message_size: usize = DEFAULT_MAX_MESSAGE_SIZE,
     /// Accumulated fragments for fragmented messages.
     fragment_buffer: std.ArrayListUnmanaged(u8) = .empty,
     fragment_opcode: ?Opcode = null,
@@ -491,14 +527,30 @@ pub const FrameReader = struct {
 
     /// Threshold for compacting the buffer (compact when read_offset exceeds this).
     const COMPACT_THRESHOLD = 4096;
+    /// Default maximum message size (16 MB).
+    pub const DEFAULT_MAX_MESSAGE_SIZE = 16 * 1024 * 1024;
 
     pub fn init(allocator: Allocator) Self {
         return .{ .allocator = allocator };
     }
 
+    pub fn initWithLimits(allocator: Allocator, max_payload: usize, max_message: usize) Self {
+        return .{
+            .allocator = allocator,
+            .max_payload_size = max_payload,
+            .max_message_size = max_message,
+        };
+    }
+
     pub fn deinit(self: *Self) void {
         self.buffer.deinit(self.allocator);
         self.fragment_buffer.deinit(self.allocator);
+    }
+
+    /// Resets fragment state (used when aborting a fragmented message).
+    fn resetFragmentState(self: *Self) void {
+        self.fragment_buffer.clearRetainingCapacity();
+        self.fragment_opcode = null;
     }
 
     /// Feeds data into the reader buffer.
@@ -551,6 +603,12 @@ pub const FrameReader = struct {
                     self.allocator.free(result.payload_owned);
                     return error.UnexpectedContinuation;
                 }
+                // Check if adding this fragment would exceed max message size
+                if (self.fragment_buffer.items.len + result.payload_owned.len > self.max_message_size) {
+                    self.allocator.free(result.payload_owned);
+                    self.resetFragmentState();
+                    return error.MessageTooLarge;
+                }
                 try self.fragment_buffer.appendSlice(self.allocator, result.payload_owned);
                 self.allocator.free(result.payload_owned);
             } else {
@@ -563,6 +621,12 @@ pub const FrameReader = struct {
                 if (frame.fin) {
                     // Complete unfragmented message
                     return .{ .opcode = frame.opcode, .payload = result.payload_owned };
+                }
+
+                // Start of fragmented message - check initial size
+                if (result.payload_owned.len > self.max_message_size) {
+                    self.allocator.free(result.payload_owned);
+                    return error.MessageTooLarge;
                 }
 
                 // Start of fragmented message

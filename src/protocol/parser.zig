@@ -60,10 +60,14 @@ pub const Parser = struct {
     line_buffer: std.ArrayListUnmanaged(u8) = .empty,
     max_header_size: usize = 8192,
     max_headers: usize = 100,
+    max_body_size: usize = DEFAULT_MAX_BODY_SIZE,
     header_bytes: usize = 0,
     header_count: usize = 0,
 
     const Self = @This();
+
+    /// Default maximum body size (16 MB).
+    pub const DEFAULT_MAX_BODY_SIZE = 16 * 1024 * 1024;
 
     /// Creates a new parser instance.
     pub fn init(allocator: Allocator) Self {
@@ -332,6 +336,11 @@ pub const Parser = struct {
 
     fn parseBody(self: *Self, data: []const u8) ParseError!usize {
         if (self.content_length) |len| {
+            // Check if Content-Length exceeds max body size
+            if (len > self.max_body_size) {
+                return HttpError.RequestTooLarge;
+            }
+
             const remaining = len - self.bytes_read;
             const to_read = @min(data.len, @as(usize, @intCast(remaining)));
             try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
@@ -341,6 +350,11 @@ pub const Parser = struct {
                 self.state = .complete;
             }
             return to_read;
+        }
+
+        // For bodies without Content-Length, check accumulated size
+        if (self.body_buffer.items.len + data.len > self.max_body_size) {
+            return HttpError.RequestTooLarge;
         }
 
         try self.body_buffer.appendSlice(self.allocator, data);
@@ -385,6 +399,11 @@ pub const Parser = struct {
     fn parseChunkData(self: *Self, data: []const u8) ParseError!usize {
         const remaining = self.current_chunk_size - self.bytes_read;
         const to_read = @min(data.len, remaining);
+
+        // Check if adding this chunk would exceed max body size
+        if (self.body_buffer.items.len + to_read > self.max_body_size) {
+            return HttpError.RequestTooLarge;
+        }
 
         try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
         self.bytes_read += to_read;

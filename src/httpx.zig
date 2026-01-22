@@ -318,8 +318,8 @@ pub fn isWsUpgrade(req: *const Request) bool {
 
 /// Generates the Sec-WebSocket-Accept header value from a client's key.
 /// Used by servers to complete the WebSocket handshake.
-pub fn computeWsAcceptKey(client_key: []const u8) ![28]u8 {
-    return websocket.computeAcceptKey(client_key);
+pub fn computeWsAcceptKey(client_key: []const u8) [28]u8 {
+    return websocket.computeAccept(client_key);
 }
 
 /// Generates a random 16-byte key for the Sec-WebSocket-Key header.

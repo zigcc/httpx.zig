@@ -259,10 +259,21 @@ pub fn isUpgradeRequest(request: *const Request) bool {
     return true;
 }
 
+/// Checks if a string contains CRLF sequences that could enable header injection.
+fn containsCrlf(s: []const u8) bool {
+    return mem.indexOf(u8, s, "\r") != null or mem.indexOf(u8, s, "\n") != null;
+}
+
 /// Generates the WebSocket upgrade response.
 /// Returns the complete HTTP response to send to the client.
 pub fn generateUpgradeResponse(allocator: Allocator, request: *const Request, protocol: ?[]const u8) ![]u8 {
     const key = request.headers.get(HeaderName.SEC_WEBSOCKET_KEY) orelse return error.MissingKey;
+
+    // Validate protocol against CRLF injection
+    if (protocol) |p| {
+        if (containsCrlf(p)) return error.InvalidProtocol;
+    }
+
     const accept = ws.computeAccept(key);
 
     var response = std.ArrayListUnmanaged(u8){};
