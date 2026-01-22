@@ -16,6 +16,7 @@ const Allocator = mem.Allocator;
 
 const http = @import("http.zig");
 const hpack = @import("hpack.zig");
+const HttpError = @import("../core/types.zig").HttpError;
 
 /// HTTP/2 Stream States as per RFC 7540 Section 5.1
 pub const StreamState = enum {
@@ -134,7 +135,7 @@ pub const Stream = struct {
 
     /// Opens the stream (transitions from idle to open).
     pub fn open(self: *Self) !void {
-        if (self.state != .idle) return error.InvalidStreamState;
+        if (self.state != .idle) return HttpError.StreamError;
         self.state = .open;
     }
 
@@ -146,14 +147,14 @@ pub const Stream = struct {
     /// Updates the send window by delta (can be negative for data sent).
     pub fn updateSendWindow(self: *Self, delta: i32) !void {
         const new_window = @as(i64, self.send_window) + delta;
-        if (new_window > 2147483647) return error.FlowControlError;
+        if (new_window > 2147483647) return HttpError.FlowControlError;
         self.send_window = @intCast(new_window);
     }
 
     /// Updates the receive window by delta.
     pub fn updateRecvWindow(self: *Self, delta: i32) !void {
         const new_window = @as(i64, self.recv_window) + delta;
-        if (new_window > 2147483647) return error.FlowControlError;
+        if (new_window > 2147483647) return HttpError.FlowControlError;
         self.recv_window = @intCast(new_window);
     }
 };
@@ -231,10 +232,10 @@ pub const StreamManager = struct {
         // Validate stream ID based on initiator
         const is_client_stream = (id % 2 == 1);
         if (self.is_client and is_client_stream) {
-            return error.InvalidStreamId; // Server cannot create client streams
+            return HttpError.StreamError; // Server cannot create client streams
         }
         if (!self.is_client and !is_client_stream) {
-            return error.InvalidStreamId; // Client cannot create server streams
+            return HttpError.StreamError; // Client cannot create server streams
         }
 
         try self.streams.put(self.allocator, id, Stream.init(id));
@@ -265,14 +266,14 @@ pub const StreamManager = struct {
     /// Updates connection-level send window.
     pub fn updateConnectionSendWindow(self: *Self, delta: i32) !void {
         const new_window = @as(i64, self.connection_send_window) + delta;
-        if (new_window > 2147483647) return error.FlowControlError;
+        if (new_window > 2147483647) return HttpError.FlowControlError;
         self.connection_send_window = @intCast(new_window);
     }
 
     /// Updates connection-level receive window.
     pub fn updateConnectionRecvWindow(self: *Self, delta: i32) !void {
         const new_window = @as(i64, self.connection_recv_window) + delta;
-        if (new_window > 2147483647) return error.FlowControlError;
+        if (new_window > 2147483647) return HttpError.FlowControlError;
         self.connection_recv_window = @intCast(new_window);
     }
 
@@ -336,14 +337,14 @@ pub fn parseHeadersFramePayload(
     // Check for PADDED flag (0x08)
     var pad_length: usize = 0;
     if (flags & 0x08 != 0) {
-        if (payload.len < 1) return error.InvalidFrame;
+        if (payload.len < 1) return HttpError.FrameError;
         pad_length = payload[0];
         offset += 1;
     }
 
     // Check for PRIORITY flag (0x20)
     if (flags & 0x20 != 0) {
-        if (payload.len < offset + 5) return error.InvalidFrame;
+        if (payload.len < offset + 5) return HttpError.FrameError;
         const dep_raw = (@as(u32, payload[offset]) << 24) |
             (@as(u32, payload[offset + 1]) << 16) |
             (@as(u32, payload[offset + 2]) << 8) |
@@ -358,7 +359,7 @@ pub fn parseHeadersFramePayload(
 
     // Remaining is HPACK block (minus padding)
     const header_block_len = payload.len - offset - pad_length;
-    if (header_block_len > payload.len - offset) return error.InvalidFrame;
+    if (header_block_len > payload.len - offset) return HttpError.FrameError;
 
     const headers = try hpack.decodeHeaders(
         &stream_manager.hpack_ctx,
@@ -386,12 +387,12 @@ pub fn buildWindowUpdatePayload(increment: u31) [4]u8 {
 
 /// Parses a WINDOW_UPDATE frame payload.
 pub fn parseWindowUpdatePayload(payload: []const u8) !u31 {
-    if (payload.len != 4) return error.InvalidFrame;
+    if (payload.len != 4) return HttpError.FrameError;
     const increment = (@as(u32, payload[0] & 0x7F) << 24) |
         (@as(u32, payload[1]) << 16) |
         (@as(u32, payload[2]) << 8) |
         payload[3];
-    if (increment == 0) return error.ProtocolError; // WINDOW_UPDATE with 0 is protocol error
+    if (increment == 0) return HttpError.ProtocolError; // WINDOW_UPDATE with 0 is protocol error
     return @intCast(increment);
 }
 
@@ -408,7 +409,7 @@ pub fn buildRstStreamPayload(error_code: http.Http2ErrorCode) [4]u8 {
 
 /// Parses an RST_STREAM frame payload.
 pub fn parseRstStreamPayload(payload: []const u8) !http.Http2ErrorCode {
-    if (payload.len != 4) return error.InvalidFrame;
+    if (payload.len != 4) return HttpError.FrameError;
     const code = (@as(u32, payload[0]) << 24) |
         (@as(u32, payload[1]) << 16) |
         (@as(u32, payload[2]) << 8) |
@@ -431,7 +432,7 @@ pub fn buildPriorityPayload(priority: StreamPriority) [5]u8 {
 
 /// Parses a PRIORITY frame payload.
 pub fn parsePriorityPayload(payload: []const u8) !StreamPriority {
-    if (payload.len != 5) return error.InvalidFrame;
+    if (payload.len != 5) return HttpError.FrameError;
     const dep_raw = (@as(u32, payload[0]) << 24) |
         (@as(u32, payload[1]) << 16) |
         (@as(u32, payload[2]) << 8) |
@@ -472,7 +473,7 @@ pub fn parseGoawayPayload(payload: []const u8, allocator: Allocator) !struct {
     error_code: http.Http2ErrorCode,
     debug_data: ?[]u8,
 } {
-    if (payload.len < 8) return error.InvalidFrame;
+    if (payload.len < 8) return HttpError.FrameError;
 
     const last_stream_id: u31 = @intCast(
         (@as(u32, payload[0] & 0x7F) << 24) |

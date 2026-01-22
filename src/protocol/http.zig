@@ -17,6 +17,7 @@ const Allocator = mem.Allocator;
 const builtin = @import("builtin");
 
 const types = @import("../core/types.zig");
+const HttpError = types.HttpError;
 const Headers = @import("../core/headers.zig").Headers;
 const HeaderName = @import("../core/headers.zig").HeaderName;
 const Request = @import("../core/request.zig").Request;
@@ -173,7 +174,7 @@ pub const Http1Connection = struct {
             var read: usize = 0;
             while (read < chunk_size) {
                 const n = try self.reader.read(chunk[read..]);
-                if (n == 0) return error.UnexpectedEof;
+                if (n == 0) return HttpError.UnexpectedEof;
                 read += n;
             }
 
@@ -237,8 +238,8 @@ pub const Http1Connection = struct {
 fn parseStatusLine(line: []const u8) !u16 {
     var parts = mem.splitScalar(u8, line, ' ');
     _ = parts.next();
-    const status_str = parts.next() orelse return error.InvalidResponse;
-    return std.fmt.parseInt(u16, status_str, 10) catch error.InvalidResponse;
+    const status_str = parts.next() orelse return HttpError.InvalidResponse;
+    return std.fmt.parseInt(u16, status_str, 10) catch HttpError.InvalidResponse;
 }
 
 /// HTTP/2 frame types as defined in RFC 7540.
@@ -522,23 +523,23 @@ pub const Http3ErrorCode = enum(u64) {
 /// Encodes an integer into the Variable-Length Integer format specified in RFC 9000.
 pub fn encodeVarInt(value: u64, dest: []u8) !usize {
     if (value < 64) {
-        if (dest.len < 1) return error.BufferTooSmall;
+        if (dest.len < 1) return HttpError.BufferTooSmall;
         dest[0] = @as(u8, @intCast(value));
         return 1;
     } else if (value < 16384) {
-        if (dest.len < 2) return error.BufferTooSmall;
+        if (dest.len < 2) return HttpError.BufferTooSmall;
         dest[0] = @as(u8, @intCast((value >> 8) | 0x40));
         dest[1] = @as(u8, @intCast(value & 0xFF));
         return 2;
     } else if (value < 1073741824) {
-        if (dest.len < 4) return error.BufferTooSmall;
+        if (dest.len < 4) return HttpError.BufferTooSmall;
         dest[0] = @as(u8, @intCast((value >> 24) | 0x80));
         dest[1] = @as(u8, @intCast((value >> 16) & 0xFF));
         dest[2] = @as(u8, @intCast((value >> 8) & 0xFF));
         dest[3] = @as(u8, @intCast(value & 0xFF));
         return 4;
     } else if (value < 4611686018427387904) {
-        if (dest.len < 8) return error.BufferTooSmall;
+        if (dest.len < 8) return HttpError.BufferTooSmall;
         dest[0] = @as(u8, @intCast((value >> 56) | 0xC0));
         dest[1] = @as(u8, @intCast((value >> 48) & 0xFF));
         dest[2] = @as(u8, @intCast((value >> 40) & 0xFF));
@@ -554,12 +555,12 @@ pub fn encodeVarInt(value: u64, dest: []u8) !usize {
 
 /// Decodes an integer from the Variable-Length Integer format.
 pub fn decodeVarInt(data: []const u8) !struct { value: u64, len: usize } {
-    if (data.len == 0) return error.UnexpectedEof;
+    if (data.len == 0) return HttpError.UnexpectedEof;
     const first = data[0];
     const prefix = first >> 6;
     const len: usize = @as(usize, 1) << @as(u3, @intCast(prefix));
 
-    if (data.len < len) return error.UnexpectedEof;
+    if (data.len < len) return HttpError.UnexpectedEof;
 
     var value: u64 = @as(u64, first & 0x3F);
     var i: usize = 1;

@@ -11,6 +11,8 @@ const std = @import("std");
 const net = std.net;
 const Allocator = std.mem.Allocator;
 
+const HttpError = @import("../core/types.zig").HttpError;
+
 /// Resolves a hostname to a network address.
 pub fn resolve(hostname: []const u8, port: u16) !net.Address {
     if (parseIp4(hostname)) |ip4| {
@@ -18,14 +20,14 @@ pub fn resolve(hostname: []const u8, port: u16) !net.Address {
     }
 
     if (parseIp6(hostname)) |ip6| {
-        return net.Address.initIp6(ip6, 0, port);
+        return net.Address.initIp6(ip6, port, 0, 0);
     }
 
     const list = try net.getAddressList(std.heap.page_allocator, hostname, port);
     defer list.deinit();
 
     if (list.addrs.len == 0) {
-        return error.DnsResolutionFailed;
+        return HttpError.DnsResolutionFailed;
     }
 
     return list.addrs[0];
@@ -85,6 +87,8 @@ fn parseIp6(str: []const u8) ?[16]u8 {
         if (str[i] == ':') {
             if (i + 1 < str.len and str[i + 1] == ':') {
                 if (abbreviated_at != null) return null;
+                // Reject ":::" (triple colon)
+                if (i + 2 < str.len and str[i + 2] == ':') return null;
                 abbreviated_at = group_count;
                 i += 2;
                 if (i >= str.len) break;
@@ -126,20 +130,23 @@ fn parseIp6(str: []const u8) ?[16]u8 {
         const at = abbreviated_at orelse return null;
         const tail = group_count - at;
 
-        // Move tail groups to the end
-        var dst: isize = 7;
-        var src: isize = @intCast(group_count - 1);
-        var moved: usize = 0;
-        while (moved < tail) : (moved += 1) {
-            groups[@intCast(dst)] = groups[@intCast(src)];
-            dst -= 1;
-            src -= 1;
+        // Move tail groups to the end (if any)
+        if (tail > 0) {
+            var dst: isize = 7;
+            var src: isize = @intCast(group_count - 1);
+            var moved: usize = 0;
+            while (moved < tail) : (moved += 1) {
+                groups[@intCast(dst)] = groups[@intCast(src)];
+                dst -= 1;
+                src -= 1;
+            }
+            // Zero fill between at and the start of moved tail
+            var z: usize = at;
+            while (z <= @as(usize, @intCast(dst))) : (z += 1) {
+                groups[z] = 0;
+            }
         }
-        // Zero fill between at and the start of moved tail
-        var z: usize = at;
-        while (z <= @as(usize, @intCast(dst))) : (z += 1) {
-            groups[z] = 0;
-        }
+        // If tail == 0 (e.g., "2001::" or "::"), groups after 'at' are already 0
     } else if (abbreviated_at != null) {
         // "::" with exactly 8 groups is not valid
         return null;
@@ -232,6 +239,86 @@ test "parseIp6 full" {
     try std.testing.expectEqual(@as(u8, 0x01), ip.?[15]);
 }
 
+test "parseIp6 all zeros" {
+    const ip = parseIp6("::");
+    try std.testing.expect(ip != null);
+    for (ip.?) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+}
+
+test "parseIp6 trailing abbreviation" {
+    // 2001:: should expand to 2001:0:0:0:0:0:0:0
+    const ip = parseIp6("2001::");
+    try std.testing.expect(ip != null);
+    try std.testing.expectEqual(@as(u8, 0x20), ip.?[0]);
+    try std.testing.expectEqual(@as(u8, 0x01), ip.?[1]);
+    for (ip.?[2..]) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+}
+
+test "parseIp6 middle abbreviation" {
+    // fe80::1 should expand to fe80:0:0:0:0:0:0:1
+    const ip = parseIp6("fe80::1");
+    try std.testing.expect(ip != null);
+    try std.testing.expectEqual(@as(u8, 0xfe), ip.?[0]);
+    try std.testing.expectEqual(@as(u8, 0x80), ip.?[1]);
+    // middle bytes should be zero
+    for (ip.?[2..14]) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+    try std.testing.expectEqual(@as(u8, 0x00), ip.?[14]);
+    try std.testing.expectEqual(@as(u8, 0x01), ip.?[15]);
+}
+
+test "parseIp6 multiple groups around abbreviation" {
+    // 2001:db8::1:0 should expand to 2001:db8:0:0:0:0:1:0
+    const ip = parseIp6("2001:db8::1:0");
+    try std.testing.expect(ip != null);
+    try std.testing.expectEqual(@as(u8, 0x20), ip.?[0]);
+    try std.testing.expectEqual(@as(u8, 0x01), ip.?[1]);
+    try std.testing.expectEqual(@as(u8, 0x0d), ip.?[2]);
+    try std.testing.expectEqual(@as(u8, 0xb8), ip.?[3]);
+    // middle zeros
+    for (ip.?[4..12]) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+    try std.testing.expectEqual(@as(u8, 0x00), ip.?[12]);
+    try std.testing.expectEqual(@as(u8, 0x01), ip.?[13]);
+    try std.testing.expectEqual(@as(u8, 0x00), ip.?[14]);
+    try std.testing.expectEqual(@as(u8, 0x00), ip.?[15]);
+}
+
+test "parseIp6 invalid double abbreviation" {
+    // Multiple :: is invalid
+    try std.testing.expect(parseIp6("1::2::3") == null);
+}
+
+test "parseIp6 invalid triple colon" {
+    try std.testing.expect(parseIp6(":::1") == null);
+}
+
+test "parseIp6 invalid single colon start" {
+    try std.testing.expect(parseIp6(":1") == null);
+}
+
+test "parseIp6 invalid single colon end" {
+    try std.testing.expect(parseIp6("1:") == null);
+}
+
+test "parseIp6 invalid zone id" {
+    try std.testing.expect(parseIp6("fe80::1%eth0") == null);
+}
+
+test "parseIp6 invalid too many groups" {
+    try std.testing.expect(parseIp6("1:2:3:4:5:6:7:8:9") == null);
+}
+
+test "parseIp6 invalid hex digit" {
+    try std.testing.expect(parseIp6("gggg::1") == null);
+}
+
 test "parseIp4 valid" {
     const ip = parseIp4("192.168.1.1");
     try std.testing.expect(ip != null);
@@ -251,6 +338,43 @@ test "parseIp4 invalid" {
     try std.testing.expect(parseIp4("example.com") == null);
     try std.testing.expect(parseIp4("256.1.1.1") == null);
     try std.testing.expect(parseIp4("1.2.3") == null);
+}
+
+test "parseIp4 leading zeros accepted" {
+    // Leading zeros are accepted (not strict octal parsing)
+    const ip = parseIp4("01.02.03.04");
+    try std.testing.expect(ip != null);
+    try std.testing.expectEqual(@as(u8, 1), ip.?[0]);
+    try std.testing.expectEqual(@as(u8, 2), ip.?[1]);
+    try std.testing.expectEqual(@as(u8, 3), ip.?[2]);
+    try std.testing.expectEqual(@as(u8, 4), ip.?[3]);
+}
+
+test "parseIp4 empty segment" {
+    try std.testing.expect(parseIp4("1..2.3") == null);
+    try std.testing.expect(parseIp4("1.2..3") == null);
+}
+
+test "parseIp4 too many segments" {
+    try std.testing.expect(parseIp4("1.2.3.4.5") == null);
+}
+
+test "parseIp4 empty string" {
+    try std.testing.expect(parseIp4("") == null);
+}
+
+test "parseIp4 only dots" {
+    try std.testing.expect(parseIp4(".") == null);
+    try std.testing.expect(parseIp4("..") == null);
+    try std.testing.expect(parseIp4("...") == null);
+}
+
+test "parseIp4 leading dot" {
+    try std.testing.expect(parseIp4(".1.2.3.4") == null);
+}
+
+test "parseIp4 trailing dot" {
+    try std.testing.expect(parseIp4("1.2.3.4.") == null);
 }
 
 test "isIpAddress" {

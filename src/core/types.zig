@@ -22,6 +22,7 @@ pub const Method = enum {
     TRACE,
     CONNECT,
     CUSTOM,
+    // NOTE: in the production code, we should not enable trace
 
     /// Converts the method to its canonical string representation.
     pub fn toString(self: Method) []const u8 {
@@ -39,21 +40,22 @@ pub const Method = enum {
         };
     }
 
+    const methods = [_]struct { name: []const u8, method: Method }{
+        .{ .name = "GET", .method = .GET },
+        .{ .name = "POST", .method = .POST },
+        .{ .name = "PUT", .method = .PUT },
+        .{ .name = "DELETE", .method = .DELETE },
+        .{ .name = "PATCH", .method = .PATCH },
+        .{ .name = "HEAD", .method = .HEAD },
+        .{ .name = "OPTIONS", .method = .OPTIONS },
+        .{ .name = "TRACE", .method = .TRACE },
+        .{ .name = "CONNECT", .method = .CONNECT },
+    };
+
     /// Parses a string into a Method enum value.
     /// Returns null for unrecognized method strings.
     pub fn fromString(str: []const u8) ?Method {
-        const methods = [_]struct { name: []const u8, method: Method }{
-            .{ .name = "GET", .method = .GET },
-            .{ .name = "POST", .method = .POST },
-            .{ .name = "PUT", .method = .PUT },
-            .{ .name = "DELETE", .method = .DELETE },
-            .{ .name = "PATCH", .method = .PATCH },
-            .{ .name = "HEAD", .method = .HEAD },
-            .{ .name = "OPTIONS", .method = .OPTIONS },
-            .{ .name = "TRACE", .method = .TRACE },
-            .{ .name = "CONNECT", .method = .CONNECT },
-        };
-        for (methods) |m| {
+        inline for (methods) |m| {
             if (std.mem.eql(u8, str, m.name)) return m.method;
         }
         return null;
@@ -126,6 +128,7 @@ pub const Version = enum {
     }
 
     /// Returns true if the version supports server push.
+    /// Note: HTTP/3 spec includes server push but major browsers disabled it.
     pub fn supportsServerPush(self: Version) bool {
         return self == .HTTP_2;
     }
@@ -142,32 +145,97 @@ pub const Version = enum {
 };
 
 /// HTTP error types with context information for debugging.
+/// Organized by category for clarity.
 pub const HttpError = error{
+    // ===== Connection Errors =====
+    /// Failed to establish connection to the server.
     ConnectionFailed,
+    /// Connection was reset by the peer (TCP RST).
     ConnectionReset,
+    /// Connection was closed gracefully by the peer.
+    ConnectionClosed,
+    /// Connection attempt timed out.
     ConnectionTimeout,
-    InvalidUri,
-    InvalidResponse,
-    InvalidHeader,
-    InvalidChunkSize,
-    TooManyRedirects,
-    TlsHandshakeFailed,
-    TlsCertificateError,
-    TlsError,
-    ResponseTooLarge,
-    RequestTooLarge,
-    Timeout,
+    /// Target host is unreachable (network/routing issue).
     HostUnreachable,
+    /// DNS lookup failed to resolve hostname.
     DnsResolutionFailed,
+
+    // ===== URI/URL Errors =====
+    /// Malformed or invalid URI format.
+    InvalidUri,
+    /// URI scheme not supported (e.g., ftp://).
+    UnsupportedScheme,
+
+    // ===== TLS/SSL Errors =====
+    /// TLS handshake failed.
+    TlsHandshakeFailed,
+    /// TLS certificate validation failed.
+    TlsCertificateError,
+    /// General TLS protocol error.
+    TlsError,
+
+    // ===== HTTP Parsing Errors =====
+    /// Malformed HTTP response.
+    InvalidResponse,
+    /// Malformed HTTP header.
+    InvalidHeader,
+    /// Single header exceeds maximum allowed size.
+    HeaderTooLarge,
+    /// Too many headers in the message.
+    TooManyHeaders,
+    /// Invalid chunk size in chunked transfer encoding.
+    InvalidChunkSize,
+    /// Invalid chunk encoding format.
+    InvalidChunkEncoding,
+
+    // ===== Request/Response Limits =====
+    /// Response body exceeds maximum allowed size.
+    ResponseTooLarge,
+    /// Request body exceeds maximum allowed size.
+    RequestTooLarge,
+    /// Exceeded maximum number of redirects.
+    TooManyRedirects,
+    /// Operation timed out.
+    Timeout,
+
+    // ===== Protocol Errors =====
+    /// General HTTP protocol violation.
     ProtocolError,
+    /// Stream-level error (HTTP/2, HTTP/3).
     StreamError,
+    /// Flow control violation (HTTP/2, HTTP/3).
     FlowControlError,
+    /// Invalid frame format (HTTP/2, HTTP/3).
     FrameError,
+    /// Header compression error (HPACK/QPACK).
     CompressionError,
+    /// HTTP/2 specific protocol error.
     Http2Error,
+    /// HTTP/3 specific protocol error.
     Http3Error,
+    /// QUIC transport layer error.
     QuicError,
+
+    // ===== Proxy Errors =====
+    /// Proxy connection or communication failed.
+    ProxyError,
+    /// Proxy authentication required or failed.
+    ProxyAuthenticationRequired,
+
+    // ===== WebSocket Errors =====
+    /// WebSocket handshake failed.
+    HandshakeFailed,
+    /// WebSocket connection is not open.
+    ConnectionNotOpen,
+
+    // ===== Resource Errors =====
+    /// Memory allocation failed.
     OutOfMemory,
+    /// Buffer too small for operation.
+    BufferTooSmall,
+    /// Unexpected end of stream/data.
+    UnexpectedEof,
 };
 
 /// Common MIME content types for HTTP messages.

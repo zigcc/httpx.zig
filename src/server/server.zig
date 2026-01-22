@@ -26,6 +26,9 @@ const Socket = @import("../net/socket.zig").Socket;
 const TcpListener = @import("../net/socket.zig").TcpListener;
 const Router = @import("router.zig").Router;
 const Middleware = @import("middleware.zig").Middleware;
+const ws_handler = @import("ws_handler.zig");
+const WebSocketHandler = ws_handler.WebSocketHandler;
+const WebSocketConnection = ws_handler.WebSocketConnection;
 
 /// Server configuration.
 pub const ServerConfig = struct {
@@ -147,6 +150,7 @@ pub const Server = struct {
     config: ServerConfig,
     router: Router,
     middleware: std.ArrayListUnmanaged(Middleware) = .empty,
+    ws_handlers: std.StringHashMapUnmanaged(WebSocketHandler) = .{},
     listener: ?TcpListener = null,
     running: bool = false,
 
@@ -170,6 +174,7 @@ pub const Server = struct {
     pub fn deinit(self: *Self) void {
         self.router.deinit();
         self.middleware.deinit(self.allocator);
+        self.ws_handlers.deinit(self.allocator);
         if (self.listener) |*l| l.deinit();
     }
 
@@ -208,6 +213,16 @@ pub const Server = struct {
         try self.route(.PATCH, path, handler);
     }
 
+    /// Registers a WebSocket handler for a path.
+    pub fn websocket(self: *Self, path: []const u8, handler: WebSocketHandler) !void {
+        try self.ws_handlers.put(self.allocator, path, handler);
+    }
+
+    /// Alias for websocket() - registers a WebSocket handler.
+    pub fn ws(self: *Self, path: []const u8, handler: WebSocketHandler) !void {
+        try self.websocket(path, handler);
+    }
+
     /// Starts the server and begins accepting connections.
     pub fn listen(self: *Self) !void {
         const addr = try net.Address.parseIp(self.config.host, self.config.port);
@@ -240,7 +255,6 @@ pub const Server = struct {
     /// Handles a single connection.
     fn handleConnection(self: *Self, socket: Socket) !void {
         var sock = socket;
-        defer sock.close();
 
         var buffer: [8192]u8 = undefined;
         var parser = Parser.init(self.allocator);
@@ -248,7 +262,10 @@ pub const Server = struct {
 
         while (!parser.isComplete()) {
             const n = try sock.recv(&buffer);
-            if (n == 0) return;
+            if (n == 0) {
+                sock.close();
+                return;
+            }
             _ = try parser.feed(buffer[0..n]);
         }
 
@@ -266,6 +283,28 @@ pub const Server = struct {
         if (parser.getBody().len > 0) {
             req.body = parser.getBody();
         }
+
+        // Check for WebSocket upgrade
+        if (ws_handler.isUpgradeRequest(&req)) {
+            if (self.ws_handlers.get(req.uri.path)) |ws_h| {
+                // Perform WebSocket upgrade
+                var ws_conn = ws_handler.acceptUpgrade(self.allocator, sock, &req, null) catch |err| {
+                    std.debug.print("WebSocket upgrade failed: {}\n", .{err});
+                    sock.close();
+                    return;
+                };
+                defer ws_conn.deinit();
+
+                // Call the WebSocket handler
+                ws_h(&ws_conn) catch |err| {
+                    std.debug.print("WebSocket handler error: {}\n", .{err});
+                };
+                return;
+            }
+        }
+
+        // Regular HTTP handling
+        defer sock.close();
 
         var ctx = Context.init(self.allocator, &req);
         defer ctx.deinit();

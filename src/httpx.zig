@@ -12,6 +12,7 @@
 //! - **HTTP/2**: HPACK header compression (RFC 7541), stream multiplexing, flow control (RFC 7540)
 //! - **HTTP/3**: QPACK header compression (RFC 9204), HTTP/3 framing (RFC 9114)
 //! - **QUIC**: Transport framing, packet structures, variable-length integers (RFC 9000)
+//! - **WebSocket**: Full RFC 6455 implementation with client and server support
 //!
 //! ## Supported Protocols
 //!
@@ -19,6 +20,7 @@
 //! - **HTTP/1.1**: Persistent connections, chunked transfer, pipelining
 //! - **HTTP/2**: Full implementation with HPACK compression, stream multiplexing, flow control
 //! - **HTTP/3**: QPACK compression, QUIC transport framing support
+//! - **WebSocket**: Bidirectional real-time communication (RFC 6455)
 //!
 //! ## Platform Support
 //!
@@ -38,6 +40,7 @@
 //! - TLS/SSL support (HTTPS)
 //! - Timeout configuration
 //! - Cookie handling
+//! - WebSocket client with ws:// and wss:// support
 //!
 //! ### Server Features
 //! - Express-style routing with path parameters
@@ -45,12 +48,14 @@
 //! - Static file serving
 //! - JSON response helpers
 //! - Request context with user data
+//! - WebSocket endpoint handling with upgrade support
 //!
 //! ### Protocol Features
 //! - HTTP/2 HPACK header compression (RFC 7541)
 //! - HTTP/2 stream state machine and flow control
 //! - HTTP/3 QPACK header compression (RFC 9204)
 //! - QUIC transport framing (RFC 9000)
+//! - WebSocket frame encoding/decoding with masking (RFC 6455)
 //!
 //! ## Quick Start
 //!
@@ -66,6 +71,13 @@
 //! var server = httpx.Server.init(allocator);
 //! try server.get("/hello", helloHandler);
 //! try server.listen();
+//!
+//! // WebSocket client
+//! var ws = try httpx.WebSocketClient.connect(allocator, "ws://localhost:8080/chat", .{});
+//! defer ws.deinit();
+//! try ws.sendText("Hello!");
+//! const msg = try ws.receive();
+//! defer allocator.free(msg.payload);
 //! ```
 
 const std = @import("std");
@@ -83,6 +95,7 @@ pub const hpack = @import("protocol/hpack.zig");
 pub const stream = @import("protocol/stream.zig");
 pub const qpack = @import("protocol/qpack.zig");
 pub const quic = @import("protocol/quic.zig");
+pub const websocket = @import("protocol/websocket.zig");
 
 pub const socket = @import("net/socket.zig");
 pub const address = @import("net/address.zig");
@@ -95,6 +108,8 @@ pub const pool = @import("client/pool.zig");
 pub const server_mod = @import("server/server.zig");
 pub const router = @import("server/router.zig");
 pub const middleware = @import("server/middleware.zig");
+pub const ws_handler = @import("server/ws_handler.zig");
+pub const ws_client = @import("client/ws_client.zig");
 
 pub const buffer = @import("util/buffer.zig");
 pub const encoding = @import("util/encoding.zig");
@@ -119,6 +134,11 @@ pub const RetryPolicy = types.RetryPolicy;
 pub const RedirectPolicy = types.RedirectPolicy;
 pub const Http2Settings = types.Http2Settings;
 pub const Http3Settings = types.Http3Settings;
+
+// Specialized error types for specific modules
+pub const ParseError = parser.ParseError;
+pub const ClientError = client_mod.ClientError;
+pub const WebSocketError = ws_client.WebSocketError;
 
 pub const Headers = headers.Headers;
 pub const HeaderName = headers.HeaderName;
@@ -181,6 +201,17 @@ pub const QuicStreamFrame = quic.StreamFrame;
 pub const QuicCryptoFrame = quic.CryptoFrame;
 pub const QuicAckFrame = quic.AckFrame;
 pub const QuicTransportParameters = quic.TransportParameters;
+
+// WebSocket exports
+pub const WebSocketClient = ws_client.WebSocketClient;
+pub const WebSocketConnection = ws_handler.WebSocketConnection;
+pub const WebSocketHandler = ws_handler.WebSocketHandler;
+pub const WebSocketOptions = ws_client.WebSocketOptions;
+pub const WebSocketMessage = ws_client.Message;
+pub const WsOpcode = websocket.Opcode;
+pub const WsFrame = websocket.Frame;
+pub const WsCloseCode = websocket.CloseCode;
+pub const isWebSocketUpgrade = ws_handler.isUpgradeRequest;
 
 pub const formatRequest = http.formatRequest;
 pub const formatResponse = http.formatResponse;
@@ -260,6 +291,43 @@ pub fn postJson(allocator: std.mem.Allocator, url: []const u8, body: []const u8)
     return c.post(url, .{ .json = body });
 }
 
+// =============================================================================
+// WebSocket Convenience Functions
+// =============================================================================
+
+/// Connects to a WebSocket server and returns a client connection.
+/// Supports both ws:// and wss:// (TLS) URLs.
+///
+/// Example:
+/// ```zig
+/// var ws = try httpx.connectWebSocket(allocator, "ws://localhost:8080/chat", .{});
+/// defer ws.deinit();
+/// try ws.sendText("Hello!");
+/// const msg = try ws.receive();
+/// defer allocator.free(msg.payload);
+/// ```
+pub fn connectWebSocket(allocator: std.mem.Allocator, url: []const u8, options: WebSocketOptions) !WebSocketClient {
+    return WebSocketClient.connect(allocator, url, options);
+}
+
+/// Checks if an HTTP request is a WebSocket upgrade request.
+/// Useful for servers to detect incoming WebSocket connections.
+pub fn isWsUpgrade(req: *const Request) bool {
+    return ws_handler.isUpgradeRequest(req);
+}
+
+/// Generates the Sec-WebSocket-Accept header value from a client's key.
+/// Used by servers to complete the WebSocket handshake.
+pub fn computeWsAcceptKey(client_key: []const u8) ![28]u8 {
+    return websocket.computeAcceptKey(client_key);
+}
+
+/// Generates a random 16-byte key for the Sec-WebSocket-Key header.
+/// Used by clients initiating a WebSocket connection.
+pub fn generateWsKey() [24]u8 {
+    return websocket.generateKey();
+}
+
 test "core types" {
     _ = types;
 }
@@ -302,6 +370,18 @@ test "qpack" {
 
 test "quic" {
     _ = quic;
+}
+
+test "websocket" {
+    _ = websocket;
+}
+
+test "ws_client" {
+    _ = ws_client;
+}
+
+test "ws_handler" {
+    _ = ws_handler;
 }
 
 test "parser" {

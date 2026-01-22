@@ -13,8 +13,12 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 const types = @import("../core/types.zig");
+const HttpError = types.HttpError;
 const Headers = @import("../core/headers.zig").Headers;
 const Status = @import("../core/status.zig").Status;
+
+/// Parser error type - combines HttpError with allocator errors.
+pub const ParseError = HttpError || Allocator.Error;
 
 /// Parser state machine states.
 pub const ParserState = enum {
@@ -97,7 +101,8 @@ pub const Parser = struct {
     }
 
     /// Feeds data to the parser, returning the number of bytes consumed.
-    pub fn feed(self: *Self, data: []const u8) !usize {
+    /// Returns ParseError on parsing failures or memory allocation errors.
+    pub fn feed(self: *Self, data: []const u8) ParseError!usize {
         var consumed: usize = 0;
 
         while (consumed < data.len and self.state != .complete and self.state != .err) {
@@ -163,19 +168,19 @@ pub const Parser = struct {
         self.header_count = 0;
     }
 
-    fn checkLineBufferLimit(self: *Self) !void {
+    fn checkLineBufferLimit(self: *Self) ParseError!void {
         if (self.line_buffer.items.len > self.max_header_size) {
             self.state = .err;
-            return error.HeaderTooLarge;
+            return HttpError.HeaderTooLarge;
         }
     }
 
-    fn bumpHeaderBytes(self: *Self, line_len: usize) !void {
+    fn bumpHeaderBytes(self: *Self, line_len: usize) ParseError!void {
         // Account for CRLF too.
         self.header_bytes += line_len + 2;
         if (self.header_bytes > self.max_header_size) {
             self.state = .err;
-            return error.HeaderTooLarge;
+            return HttpError.HeaderTooLarge;
         }
     }
 
@@ -190,7 +195,7 @@ pub const Parser = struct {
         return 0;
     }
 
-    fn parseRequestLine(self: *Self, data: []const u8) !usize {
+    fn parseRequestLine(self: *Self, data: []const u8) ParseError!usize {
         const line_end = mem.indexOf(u8, data, "\r\n") orelse {
             try self.line_buffer.appendSlice(self.allocator, data);
             try self.checkLineBufferLimit();
@@ -229,7 +234,7 @@ pub const Parser = struct {
         return line_end + 2;
     }
 
-    fn parseStatusLine(self: *Self, data: []const u8) !usize {
+    fn parseStatusLine(self: *Self, data: []const u8) ParseError!usize {
         const line_end = mem.indexOf(u8, data, "\r\n") orelse {
             try self.line_buffer.appendSlice(self.allocator, data);
             try self.checkLineBufferLimit();
@@ -265,7 +270,7 @@ pub const Parser = struct {
         return line_end + 2;
     }
 
-    fn parseHeaders(self: *Self, data: []const u8) !usize {
+    fn parseHeaders(self: *Self, data: []const u8) ParseError!usize {
         const line_end = mem.indexOf(u8, data, "\r\n") orelse {
             try self.line_buffer.appendSlice(self.allocator, data);
             try self.checkLineBufferLimit();
@@ -289,7 +294,7 @@ pub const Parser = struct {
         if (mem.indexOf(u8, line, ":")) |sep| {
             if (self.header_count >= self.max_headers) {
                 self.state = .err;
-                return error.TooManyHeaders;
+                return HttpError.TooManyHeaders;
             }
             const name = mem.trim(u8, line[0..sep], " \t");
             const value = mem.trim(u8, line[sep + 1 ..], " \t");
@@ -325,7 +330,7 @@ pub const Parser = struct {
         }
     }
 
-    fn parseBody(self: *Self, data: []const u8) !usize {
+    fn parseBody(self: *Self, data: []const u8) ParseError!usize {
         if (self.content_length) |len| {
             const remaining = len - self.bytes_read;
             const to_read = @min(data.len, @as(usize, @intCast(remaining)));
@@ -342,7 +347,7 @@ pub const Parser = struct {
         return data.len;
     }
 
-    fn parseChunkSize(self: *Self, data: []const u8) !usize {
+    fn parseChunkSize(self: *Self, data: []const u8) ParseError!usize {
         const line_end = mem.indexOf(u8, data, "\r\n") orelse {
             try self.line_buffer.appendSlice(self.allocator, data);
             try self.checkLineBufferLimit();
@@ -377,7 +382,7 @@ pub const Parser = struct {
         return line_end + 2;
     }
 
-    fn parseChunkData(self: *Self, data: []const u8) !usize {
+    fn parseChunkData(self: *Self, data: []const u8) ParseError!usize {
         const remaining = self.current_chunk_size - self.bytes_read;
         const to_read = @min(data.len, remaining);
 
@@ -391,7 +396,7 @@ pub const Parser = struct {
         return to_read;
     }
 
-    fn parseChunkCrlf(self: *Self, data: []const u8) !usize {
+    fn parseChunkCrlf(self: *Self, data: []const u8) ParseError!usize {
         if (data.len == 0) return 0;
 
         var consumed: usize = 0;
@@ -400,11 +405,11 @@ pub const Parser = struct {
             switch (self.chunk_crlf_read) {
                 0 => if (b != '\r') {
                     self.state = .err;
-                    return error.InvalidChunkEncoding;
+                    return HttpError.InvalidChunkEncoding;
                 },
                 1 => if (b != '\n') {
                     self.state = .err;
-                    return error.InvalidChunkEncoding;
+                    return HttpError.InvalidChunkEncoding;
                 },
                 else => {},
             }
@@ -420,7 +425,7 @@ pub const Parser = struct {
         return consumed;
     }
 
-    fn parseChunkTrailer(self: *Self, data: []const u8) !usize {
+    fn parseChunkTrailer(self: *Self, data: []const u8) ParseError!usize {
         const line_end = mem.indexOf(u8, data, "\r\n") orelse {
             try self.line_buffer.appendSlice(self.allocator, data);
             try self.checkLineBufferLimit();
