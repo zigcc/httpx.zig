@@ -134,6 +134,8 @@ pub const RetryPolicy = types.RetryPolicy;
 pub const RedirectPolicy = types.RedirectPolicy;
 pub const Http2Settings = types.Http2Settings;
 pub const Http3Settings = types.Http3Settings;
+pub const TransferEncoding = types.TransferEncoding;
+pub const ContentEncoding = types.ContentEncoding;
 
 // Specialized error types for specific modules
 pub const ParseError = parser.ParseError;

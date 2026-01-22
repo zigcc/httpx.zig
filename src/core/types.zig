@@ -375,13 +375,19 @@ pub const ContentType = enum {
     }
 };
 
-/// Transfer encoding types for HTTP message bodies.
+/// Transfer-Encoding header values (RFC 7230 Section 4).
+/// Used for hop-by-hop transfer codings applied during message transfer.
 pub const TransferEncoding = enum {
+    /// No transformation (deprecated in HTTP/1.1).
     identity,
+    /// Chunked transfer coding - data sent in chunks.
     chunked,
+    /// Gzip compression.
     gzip,
+    /// Deflate compression.
     deflate,
-    br,
+    /// LZW compression (rarely used).
+    compress,
 
     pub fn toString(self: TransferEncoding) []const u8 {
         return switch (self) {
@@ -389,8 +395,55 @@ pub const TransferEncoding = enum {
             .chunked => "chunked",
             .gzip => "gzip",
             .deflate => "deflate",
-            .br => "br",
+            .compress => "compress",
         };
+    }
+
+    pub fn fromString(str: []const u8) ?TransferEncoding {
+        if (std.mem.eql(u8, str, "identity")) return .identity;
+        if (std.mem.eql(u8, str, "chunked")) return .chunked;
+        if (std.mem.eql(u8, str, "gzip")) return .gzip;
+        if (std.mem.eql(u8, str, "deflate")) return .deflate;
+        if (std.mem.eql(u8, str, "compress")) return .compress;
+        return null;
+    }
+};
+
+/// Content-Encoding header values (RFC 7231, RFC 7932, RFC 8878).
+/// Used for end-to-end content codings applied to the message payload.
+pub const ContentEncoding = enum {
+    /// No transformation.
+    identity,
+    /// Gzip compression (RFC 1952).
+    gzip,
+    /// Deflate compression (RFC 1951).
+    deflate,
+    /// Brotli compression (RFC 7932).
+    br,
+    /// LZW compression (rarely used).
+    compress,
+    /// Zstandard compression (RFC 8878).
+    zstd,
+
+    pub fn toString(self: ContentEncoding) []const u8 {
+        return switch (self) {
+            .identity => "identity",
+            .gzip => "gzip",
+            .deflate => "deflate",
+            .br => "br",
+            .compress => "compress",
+            .zstd => "zstd",
+        };
+    }
+
+    pub fn fromString(str: []const u8) ?ContentEncoding {
+        if (std.mem.eql(u8, str, "identity")) return .identity;
+        if (std.mem.eql(u8, str, "gzip")) return .gzip;
+        if (std.mem.eql(u8, str, "deflate")) return .deflate;
+        if (std.mem.eql(u8, str, "br")) return .br;
+        if (std.mem.eql(u8, str, "compress")) return .compress;
+        if (std.mem.eql(u8, str, "zstd")) return .zstd;
+        return null;
     }
 };
 
