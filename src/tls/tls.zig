@@ -14,6 +14,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const Socket = @import("../net/socket.zig").Socket;
+const HttpError = @import("../core/types.zig").HttpError;
 const SocketIoReader = @import("../net/socket.zig").SocketIoReader;
 const SocketIoWriter = @import("../net/socket.zig").SocketIoWriter;
 
@@ -201,7 +202,7 @@ pub const TlsSession = struct {
 
     /// Reads decrypted data from the session.
     pub fn read(self: *Self, buffer: []u8) !usize {
-        const c = if (self.client) |*c| c else return error.NotConnected;
+        const c = if (self.client) |*c| c else return HttpError.ConnectionNotOpen;
         var iov = [_][]u8{buffer};
         return c.reader.readVec(&iov) catch |err| switch (err) {
             error.EndOfStream => 0,
@@ -211,20 +212,20 @@ pub const TlsSession = struct {
 
     /// Writes data to be encrypted and sent.
     pub fn write(self: *Self, data: []const u8) !usize {
-        const c = if (self.client) |*c| c else return error.NotConnected;
+        const c = if (self.client) |*c| c else return HttpError.ConnectionNotOpen;
         try c.writer.writeAll(data);
         return data.len;
     }
 
     /// Returns an I/O reader for decrypted TLS payload.
     pub fn getReader(self: *Self) !*std.Io.Reader {
-        const c = if (self.client) |*c| c else return error.NotConnected;
+        const c = if (self.client) |*c| c else return HttpError.ConnectionNotOpen;
         return &c.reader;
     }
 
     /// Returns an I/O writer for TLS-encrypted payload.
     pub fn getWriter(self: *Self) !*std.Io.Writer {
-        const c = if (self.client) |*c| c else return error.NotConnected;
+        const c = if (self.client) |*c| c else return HttpError.ConnectionNotOpen;
         return &c.writer;
     }
 

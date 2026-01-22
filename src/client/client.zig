@@ -12,6 +12,7 @@ const Allocator = mem.Allocator;
 const net = std.net;
 
 const types = @import("../core/types.zig");
+const HttpError = types.HttpError;
 const Headers = @import("../core/headers.zig").Headers;
 const HeaderName = @import("../core/headers.zig").HeaderName;
 const Uri = @import("../core/uri.zig").Uri;
@@ -24,9 +25,13 @@ const SocketIoWriter = @import("../net/socket.zig").SocketIoWriter;
 const address_mod = @import("../net/address.zig");
 const http = @import("../protocol/http.zig");
 const Parser = @import("../protocol/parser.zig").Parser;
+const ParseError = @import("../protocol/parser.zig").ParseError;
 const TlsConfig = @import("../tls/tls.zig").TlsConfig;
 const TlsSession = @import("../tls/tls.zig").TlsSession;
 const ConnectionPool = @import("pool.zig").ConnectionPool;
+
+/// Client error type - combines HTTP errors with system/network errors.
+pub const ClientError = HttpError || Allocator.Error || std.posix.ConnectError || std.posix.SetSockOptError || std.posix.SendError || std.posix.RecvError || ParseError;
 
 /// HTTP client configuration.
 pub const ClientConfig = struct {
@@ -113,11 +118,12 @@ pub const Client = struct {
     }
 
     /// Makes an HTTP request.
-    pub fn request(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
+    /// Returns ClientError on failures including connection, TLS, or parsing errors.
+    pub fn request(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) ClientError!Response {
         return self.requestInternal(method, url, reqOpts, 0);
     }
 
-    fn requestInternal(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions, depth: u32) !Response {
+    fn requestInternal(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions, depth: u32) ClientError!Response {
         const full_url = if (self.config.base_url) |base|
             try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url })
         else
@@ -167,12 +173,12 @@ pub const Client = struct {
         if (should_follow and response.isRedirect()) {
             if (depth >= self.config.redirect_policy.max_redirects) {
                 response.deinit();
-                return error.TooManyRedirects;
+                return HttpError.TooManyRedirects;
             }
 
             const location = response.headers.get(HeaderName.LOCATION) orelse {
                 response.deinit();
-                return error.InvalidResponse;
+                return HttpError.InvalidResponse;
             };
 
             const next_url = try self.resolveRedirectUrl(req.uri, location);
@@ -187,7 +193,7 @@ pub const Client = struct {
     }
 
     /// Executes the actual HTTP request.
-    fn executeRequest(self: *Self, req: *Request) !Response {
+    fn executeRequest(self: *Self, req: *Request) ClientError!Response {
         const policy = self.config.retry_policy;
         const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
 
@@ -215,8 +221,8 @@ pub const Client = struct {
         }
     }
 
-    fn executeRequestOnce(self: *Self, req: *Request) !Response {
-        const host = req.uri.host orelse return error.InvalidUri;
+    fn executeRequestOnce(self: *Self, req: *Request) ClientError!Response {
+        const host = req.uri.host orelse return HttpError.InvalidUri;
         const port = req.uri.effectivePort();
 
         const request_data = try http.formatRequest(req, self.allocator);
@@ -280,7 +286,7 @@ pub const Client = struct {
         return self.readResponseFromTcp(&socket);
     }
 
-    fn executeTlsHttp(self: *Self, socket: *Socket, host: []const u8, request_data: []const u8) !Response {
+    fn executeTlsHttp(self: *Self, socket: *Socket, host: []const u8, request_data: []const u8) ClientError!Response {
         const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
 
         var session = TlsSession.init(tls_cfg);
@@ -295,7 +301,7 @@ pub const Client = struct {
         return self.readResponseFromIo(r);
     }
 
-    fn readResponseFromTcp(self: *Self, socket: *Socket) !Response {
+    fn readResponseFromTcp(self: *Self, socket: *Socket) ClientError!Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
 
@@ -308,11 +314,11 @@ pub const Client = struct {
 
         parser.finishEof();
 
-        if (!parser.isComplete()) return error.InvalidResponse;
+        if (!parser.isComplete()) return HttpError.InvalidResponse;
         return self.responseFromParser(&parser);
     }
 
-    fn readResponseFromIo(self: *Self, r: *std.Io.Reader) !Response {
+    fn readResponseFromIo(self: *Self, r: *std.Io.Reader) ClientError!Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
 
@@ -329,13 +335,13 @@ pub const Client = struct {
 
         parser.finishEof();
 
-        if (!parser.isComplete()) return error.InvalidResponse;
+        if (!parser.isComplete()) return HttpError.InvalidResponse;
         return self.responseFromParser(&parser);
     }
 
-    fn responseFromParser(self: *Self, parser: *Parser) !Response {
+    fn responseFromParser(self: *Self, parser: *Parser) ClientError!Response {
         _ = self;
-        const code = parser.status_code orelse return error.InvalidResponse;
+        const code = parser.status_code orelse return HttpError.InvalidResponse;
         var res = Response.init(parser.allocator, code);
         errdefer res.deinit();
 
@@ -352,14 +358,14 @@ pub const Client = struct {
         return res;
     }
 
-    fn resolveRedirectUrl(self: *Self, base: Uri, location: []const u8) ![]u8 {
+    fn resolveRedirectUrl(self: *Self, base: Uri, location: []const u8) ClientError![]u8 {
         // Absolute URL.
         if (mem.indexOf(u8, location, "://") != null) {
             return self.allocator.dupe(u8, location);
         }
 
         const scheme = base.scheme orelse "http";
-        const host = base.host orelse return error.InvalidUri;
+        const host = base.host orelse return HttpError.InvalidUri;
         const port = base.effectivePort();
 
         if (location.len > 0 and location[0] == '/') {
@@ -374,50 +380,50 @@ pub const Client = struct {
     }
 
     /// GET request convenience method.
-    pub fn get(self: *Self, url: []const u8, reqOpts: RequestOptions) !Response {
+    pub fn get(self: *Self, url: []const u8, reqOpts: RequestOptions) ClientError!Response {
         return self.request(.GET, url, reqOpts);
     }
 
     /// POST request convenience method.
-    pub fn post(self: *Self, url: []const u8, reqOpts: RequestOptions) !Response {
+    pub fn post(self: *Self, url: []const u8, reqOpts: RequestOptions) ClientError!Response {
         return self.request(.POST, url, reqOpts);
     }
 
     /// PUT request convenience method.
-    pub fn put(self: *Self, url: []const u8, reqOpts: RequestOptions) !Response {
+    pub fn put(self: *Self, url: []const u8, reqOpts: RequestOptions) ClientError!Response {
         return self.request(.PUT, url, reqOpts);
     }
 
     /// DELETE request convenience method.
-    pub fn delete(self: *Self, url: []const u8, reqOpts: RequestOptions) !Response {
+    pub fn delete(self: *Self, url: []const u8, reqOpts: RequestOptions) ClientError!Response {
         return self.request(.DELETE, url, reqOpts);
     }
 
     /// PATCH request convenience method.
-    pub fn patch(self: *Self, url: []const u8, reqOpts: RequestOptions) !Response {
+    pub fn patch(self: *Self, url: []const u8, reqOpts: RequestOptions) ClientError!Response {
         return self.request(.PATCH, url, reqOpts);
     }
 
     /// HEAD request convenience method.
-    pub fn head(self: *Self, url: []const u8, reqOpts: RequestOptions) !Response {
+    pub fn head(self: *Self, url: []const u8, reqOpts: RequestOptions) ClientError!Response {
         return self.request(.HEAD, url, reqOpts);
     }
 
     /// OPTIONS request convenience method.
-    pub fn httpOptions(self: *Self, url: []const u8, reqOpts: RequestOptions) !Response {
+    pub fn httpOptions(self: *Self, url: []const u8, reqOpts: RequestOptions) ClientError!Response {
         return self.request(.OPTIONS, url, reqOpts);
     }
 };
 
 /// Parses an HTTP response from raw data.
-fn parseResponse(allocator: Allocator, data: []const u8) !Response {
+fn parseResponse(allocator: Allocator, data: []const u8) ClientError!Response {
     var parser = Parser.initResponse(allocator);
     defer parser.deinit();
 
     _ = try parser.feed(data);
-    if (!parser.isComplete()) return error.InvalidResponse;
+    if (!parser.isComplete()) return HttpError.InvalidResponse;
 
-    const code = parser.status_code orelse return error.InvalidResponse;
+    const code = parser.status_code orelse return HttpError.InvalidResponse;
     var res = Response.init(allocator, code);
     errdefer res.deinit();
 

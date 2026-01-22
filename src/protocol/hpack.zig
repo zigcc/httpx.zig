@@ -14,6 +14,8 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
+const HttpError = @import("../core/types.zig").HttpError;
+
 /// HPACK static table entries (RFC 7541 Appendix A)
 /// Index 1-61 are pre-defined header name/value pairs
 pub const StaticTable = struct {
@@ -243,25 +245,25 @@ pub fn encodeInteger(value: u64, prefix_bits: u4, out: []u8) !usize {
     const max_prefix: u64 = (@as(u64, 1) << prefix_bits) - 1;
 
     if (value < max_prefix) {
-        if (out.len < 1) return error.BufferTooSmall;
+        if (out.len < 1) return HttpError.BufferTooSmall;
         out[0] = @intCast(value);
         return 1;
     }
 
-    if (out.len < 1) return error.BufferTooSmall;
+    if (out.len < 1) return HttpError.BufferTooSmall;
     out[0] = @intCast(max_prefix);
 
     var remaining = value - max_prefix;
     var i: usize = 1;
 
     while (remaining >= 128) {
-        if (i >= out.len) return error.BufferTooSmall;
+        if (i >= out.len) return HttpError.BufferTooSmall;
         out[i] = @intCast((remaining & 0x7F) | 0x80);
         remaining >>= 7;
         i += 1;
     }
 
-    if (i >= out.len) return error.BufferTooSmall;
+    if (i >= out.len) return HttpError.BufferTooSmall;
     out[i] = @intCast(remaining);
     return i + 1;
 }
@@ -269,7 +271,7 @@ pub fn encodeInteger(value: u64, prefix_bits: u4, out: []u8) !usize {
 /// Decodes an integer with the given prefix bits.
 /// Returns the value and number of bytes consumed.
 pub fn decodeInteger(data: []const u8, prefix_bits: u4) !struct { value: u64, len: usize } {
-    if (data.len == 0) return error.UnexpectedEof;
+    if (data.len == 0) return HttpError.UnexpectedEof;
 
     const max_prefix: u64 = (@as(u64, 1) << prefix_bits) - 1;
     const first_byte_mask: u8 = @intCast(max_prefix);
@@ -296,7 +298,7 @@ pub fn decodeInteger(data: []const u8, prefix_bits: u4) !struct { value: u64, le
         if (m > 63) return error.IntegerOverflow;
     }
 
-    return error.UnexpectedEof;
+    return HttpError.UnexpectedEof;
 }
 
 /// Encodes a string (with optional Huffman encoding).
@@ -322,14 +324,14 @@ pub fn encodeString(str: []const u8, use_huffman: bool, allocator: Allocator, ou
 
 /// Decodes a string (handles Huffman encoding automatically).
 pub fn decodeString(data: []const u8, allocator: Allocator) !struct { value: []u8, len: usize } {
-    if (data.len == 0) return error.UnexpectedEof;
+    if (data.len == 0) return HttpError.UnexpectedEof;
 
     const huffman = (data[0] & 0x80) != 0;
     const len_result = try decodeInteger(data, 7);
     const str_len: usize = @intCast(len_result.value);
     const total_len = len_result.len + str_len;
 
-    if (data.len < total_len) return error.UnexpectedEof;
+    if (data.len < total_len) return HttpError.UnexpectedEof;
 
     const str_data = data[len_result.len..total_len];
 

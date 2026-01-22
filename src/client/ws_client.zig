@@ -26,6 +26,8 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
+const types = @import("../core/types.zig");
+const HttpError = types.HttpError;
 const ws = @import("../protocol/websocket.zig");
 const Socket = @import("../net/socket.zig").Socket;
 const Uri = @import("../core/uri.zig").Uri;
@@ -34,6 +36,9 @@ const HeaderName = @import("../core/headers.zig").HeaderName;
 const TlsConfig = @import("../tls/tls.zig").TlsConfig;
 const TlsSession = @import("../tls/tls.zig").TlsSession;
 const address_mod = @import("../net/address.zig");
+
+/// WebSocket client error type.
+pub const WebSocketError = HttpError || Allocator.Error || std.posix.ConnectError || std.posix.SetSockOptError || std.posix.SendError || std.posix.RecvError || ws.FrameError;
 
 /// WebSocket client connection state.
 pub const ConnectionState = enum {
@@ -99,7 +104,8 @@ pub const WebSocketClient = struct {
 
     /// Connects to a WebSocket server.
     /// Supports ws:// and wss:// URLs.
-    pub fn connect(allocator: Allocator, url: []const u8, options: WebSocketOptions) !*Self {
+    /// Returns WebSocketError on connection or handshake failures.
+    pub fn connect(allocator: Allocator, url: []const u8, options: WebSocketOptions) WebSocketError!*Self {
         const uri = try Uri.parse(url);
 
         const is_secure = if (uri.scheme) |s|
@@ -107,7 +113,7 @@ pub const WebSocketClient = struct {
         else
             false;
 
-        const host = uri.host orelse return error.InvalidUri;
+        const host = uri.host orelse return HttpError.InvalidUri;
         const port = uri.port orelse if (is_secure) @as(u16, 443) else @as(u16, 80);
 
         // Resolve and connect
@@ -172,7 +178,7 @@ pub const WebSocketClient = struct {
     }
 
     /// Performs the HTTP upgrade handshake.
-    fn performHandshake(self: *Self, uri: Uri, host: []const u8) !void {
+    fn performHandshake(self: *Self, uri: Uri, host: []const u8) WebSocketError!void {
         const key = ws.generateKey();
 
         // Build HTTP upgrade request
@@ -219,7 +225,7 @@ pub const WebSocketClient = struct {
 
         while (response_len < response_buf.len) {
             const n = try self.recvRaw(response_buf[response_len..]);
-            if (n == 0) return error.ConnectionClosed;
+            if (n == 0) return HttpError.ConnectionClosed;
             response_len += n;
 
             // Check for end of headers
@@ -233,45 +239,45 @@ pub const WebSocketClient = struct {
 
         // Check status line
         if (!mem.startsWith(u8, response, "HTTP/1.1 101")) {
-            return error.HandshakeFailed;
+            return HttpError.HandshakeFailed;
         }
 
         // Validate Sec-WebSocket-Accept
         const accept_header = "Sec-WebSocket-Accept: ";
-        const accept_start = mem.indexOf(u8, response, accept_header) orelse return error.HandshakeFailed;
+        const accept_start = mem.indexOf(u8, response, accept_header) orelse return HttpError.HandshakeFailed;
         const accept_value_start = accept_start + accept_header.len;
-        const accept_end = mem.indexOfPos(u8, response, accept_value_start, "\r\n") orelse return error.HandshakeFailed;
+        const accept_end = mem.indexOfPos(u8, response, accept_value_start, "\r\n") orelse return HttpError.HandshakeFailed;
         const server_accept = response[accept_value_start..accept_end];
 
         if (!ws.validateAccept(&key, server_accept)) {
-            return error.InvalidAcceptKey;
+            return HttpError.HandshakeFailed;
         }
 
         self.state = .open;
     }
 
     /// Sends a text message.
-    pub fn sendText(self: *Self, data: []const u8) !void {
+    pub fn sendText(self: *Self, data: []const u8) WebSocketError!void {
         try self.sendFrame(.text, data);
     }
 
     /// Sends a binary message.
-    pub fn sendBinary(self: *Self, data: []const u8) !void {
+    pub fn sendBinary(self: *Self, data: []const u8) WebSocketError!void {
         try self.sendFrame(.binary, data);
     }
 
     /// Sends a ping frame.
-    pub fn ping(self: *Self, data: []const u8) !void {
+    pub fn ping(self: *Self, data: []const u8) WebSocketError!void {
         try self.sendFrame(.ping, data);
     }
 
     /// Sends a pong frame.
-    pub fn pong(self: *Self, data: []const u8) !void {
+    pub fn pong(self: *Self, data: []const u8) WebSocketError!void {
         try self.sendFrame(.pong, data);
     }
 
     /// Initiates a clean close handshake.
-    pub fn close(self: *Self, code: ws.CloseCode, reason: []const u8) !void {
+    pub fn close(self: *Self, code: ws.CloseCode, reason: []const u8) WebSocketError!void {
         if (self.state != .open) return;
 
         self.state = .closing;
@@ -291,7 +297,7 @@ pub const WebSocketClient = struct {
 
     /// Receives the next message.
     /// Automatically handles control frames (ping/pong/close).
-    pub fn receive(self: *Self) !Message {
+    pub fn receive(self: *Self) WebSocketError!Message {
         while (true) {
             // Try to read from buffer first
             if (try self.frame_reader.readMessage()) |msg| {
@@ -338,7 +344,7 @@ pub const WebSocketClient = struct {
             const n = try self.recvRaw(&buf);
             if (n == 0) {
                 self.state = .closed;
-                return error.ConnectionClosed;
+                return HttpError.ConnectionClosed;
             }
 
             try self.frame_reader.feed(buf[0..n]);
@@ -350,9 +356,9 @@ pub const WebSocketClient = struct {
 
     /// Sends a frame with the given opcode.
     /// Uses stack buffer for small messages to avoid allocation.
-    fn sendFrame(self: *Self, opcode: ws.Opcode, data: []const u8) !void {
+    fn sendFrame(self: *Self, opcode: ws.Opcode, data: []const u8) WebSocketError!void {
         if (self.state != .open and self.state != .closing) {
-            return error.ConnectionNotOpen;
+            return HttpError.ConnectionNotOpen;
         }
 
         const frame = ws.Frame{
@@ -377,7 +383,7 @@ pub const WebSocketClient = struct {
     }
 
     /// Low-level send (handles TLS vs plain).
-    fn sendRaw(self: *Self, data: []const u8) !void {
+    fn sendRaw(self: *Self, data: []const u8) WebSocketError!void {
         if (self.tls_session) |*tls| {
             _ = try tls.write(data);
         } else {
@@ -386,7 +392,7 @@ pub const WebSocketClient = struct {
     }
 
     /// Low-level receive (handles TLS vs plain).
-    fn recvRaw(self: *Self, buffer: []u8) !usize {
+    fn recvRaw(self: *Self, buffer: []u8) WebSocketError!usize {
         if (self.tls_session) |*tls| {
             return tls.read(buffer);
         } else {

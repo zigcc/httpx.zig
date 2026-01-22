@@ -15,6 +15,8 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const crypto = std.crypto;
 
+const HttpError = @import("../core/types.zig").HttpError;
+
 /// WebSocket frame opcodes as defined in RFC 6455 Section 5.2.
 pub const Opcode = enum(u4) {
     /// Continuation frame for fragmented messages.
@@ -232,7 +234,7 @@ pub fn encodeFrameInto(buffer: []u8, frame: Frame, force_mask: bool) !usize {
     const total_size = calcEncodedFrameSize(payload_len, should_mask);
 
     if (buffer.len < total_size) {
-        return error.BufferTooSmall;
+        return HttpError.BufferTooSmall;
     }
 
     var offset: usize = 0;

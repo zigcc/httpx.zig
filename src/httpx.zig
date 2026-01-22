@@ -135,6 +135,11 @@ pub const RedirectPolicy = types.RedirectPolicy;
 pub const Http2Settings = types.Http2Settings;
 pub const Http3Settings = types.Http3Settings;
 
+// Specialized error types for specific modules
+pub const ParseError = parser.ParseError;
+pub const ClientError = client_mod.ClientError;
+pub const WebSocketError = ws_client.WebSocketError;
+
 pub const Headers = headers.Headers;
 pub const HeaderName = headers.HeaderName;
 pub const Header = headers.Header;

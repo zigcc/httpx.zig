@@ -20,6 +20,7 @@ const net = std.net;
 const posix = std.posix;
 
 const http = @import("http.zig");
+const HttpError = @import("../core/types.zig").HttpError;
 
 /// QUIC version identifiers
 pub const Version = enum(u32) {
@@ -157,7 +158,7 @@ pub const LongHeader = struct {
 
     /// Encodes the header to wire format.
     pub fn encode(self: LongHeader, out: []u8) !usize {
-        if (out.len < 7 + self.dcid.len + self.scid.len) return error.BufferTooSmall;
+        if (out.len < 7 + self.dcid.len + self.scid.len) return HttpError.BufferTooSmall;
 
         var offset: usize = 0;
 
@@ -193,7 +194,7 @@ pub const LongHeader = struct {
 
     /// Decodes a long header from wire format.
     pub fn decode(data: []const u8) !struct { header: LongHeader, len: usize } {
-        if (data.len < 7) return error.UnexpectedEof;
+        if (data.len < 7) return HttpError.UnexpectedEof;
 
         var header = LongHeader{};
         var offset: usize = 0;
@@ -222,7 +223,7 @@ pub const LongHeader = struct {
         offset += dcid_len;
 
         // SCID
-        if (data.len < offset + 1) return error.UnexpectedEof;
+        if (data.len < offset + 1) return HttpError.UnexpectedEof;
         const scid_len = data[offset];
         offset += 1;
         if (scid_len > 20 or data.len < offset + scid_len) return error.InvalidConnectionId;
@@ -252,7 +253,7 @@ pub const ShortHeader = struct {
 
     /// Encodes the header to wire format.
     pub fn encode(self: ShortHeader, out: []u8) !usize {
-        if (out.len < 1 + self.dcid.len) return error.BufferTooSmall;
+        if (out.len < 1 + self.dcid.len) return HttpError.BufferTooSmall;
 
         var offset: usize = 0;
 
@@ -274,7 +275,7 @@ pub const ShortHeader = struct {
 
     /// Decodes a short header from wire format.
     pub fn decode(data: []const u8, dcid_len: u8) !struct { header: ShortHeader, len: usize } {
-        if (data.len < 1 + dcid_len) return error.UnexpectedEof;
+        if (data.len < 1 + dcid_len) return HttpError.UnexpectedEof;
 
         var header = ShortHeader{};
         var offset: usize = 0;
@@ -336,7 +337,7 @@ pub const StreamFrame = struct {
         }
 
         // Data
-        if (out.len < offset + self.data.len) return error.BufferTooSmall;
+        if (out.len < offset + self.data.len) return HttpError.BufferTooSmall;
         @memcpy(out[offset .. offset + self.data.len], self.data);
         offset += self.data.len;
 
@@ -345,7 +346,7 @@ pub const StreamFrame = struct {
 
     /// Decodes a STREAM frame.
     pub fn decode(data: []const u8) !struct { frame: StreamFrame, len: usize } {
-        if (data.len < 2) return error.UnexpectedEof;
+        if (data.len < 2) return HttpError.UnexpectedEof;
 
         var offset: usize = 0;
         const frame_type = data[offset];
@@ -379,7 +380,7 @@ pub const StreamFrame = struct {
             data_len = data.len - offset;
         }
 
-        if (data.len < offset + data_len) return error.UnexpectedEof;
+        if (data.len < offset + data_len) return HttpError.UnexpectedEof;
 
         return .{
             .frame = .{
@@ -414,7 +415,7 @@ pub const CryptoFrame = struct {
         offset += try encodeVarInt(self.data.len, out[offset..]);
 
         // Data
-        if (out.len < offset + self.data.len) return error.BufferTooSmall;
+        if (out.len < offset + self.data.len) return HttpError.BufferTooSmall;
         @memcpy(out[offset .. offset + self.data.len], self.data);
         offset += self.data.len;
 
@@ -423,7 +424,7 @@ pub const CryptoFrame = struct {
 
     /// Decodes a CRYPTO frame.
     pub fn decode(data: []const u8) !struct { frame: CryptoFrame, len: usize } {
-        if (data.len < 3) return error.UnexpectedEof;
+        if (data.len < 3) return HttpError.UnexpectedEof;
 
         var offset: usize = 0;
 
@@ -440,7 +441,7 @@ pub const CryptoFrame = struct {
         offset += len.len;
 
         const data_len: usize = @intCast(len.value);
-        if (data.len < offset + data_len) return error.UnexpectedEof;
+        if (data.len < offset + data_len) return HttpError.UnexpectedEof;
 
         return .{
             .frame = .{
@@ -519,7 +520,7 @@ pub const ConnectionCloseFrame = struct {
         // Reason Phrase Length + Reason Phrase
         offset += try encodeVarInt(self.reason_phrase.len, out[offset..]);
         if (self.reason_phrase.len > 0) {
-            if (out.len < offset + self.reason_phrase.len) return error.BufferTooSmall;
+            if (out.len < offset + self.reason_phrase.len) return HttpError.BufferTooSmall;
             @memcpy(out[offset .. offset + self.reason_phrase.len], self.reason_phrase);
             offset += self.reason_phrase.len;
         }

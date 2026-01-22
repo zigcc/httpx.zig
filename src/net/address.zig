@@ -11,6 +11,8 @@ const std = @import("std");
 const net = std.net;
 const Allocator = std.mem.Allocator;
 
+const HttpError = @import("../core/types.zig").HttpError;
+
 /// Resolves a hostname to a network address.
 pub fn resolve(hostname: []const u8, port: u16) !net.Address {
     if (parseIp4(hostname)) |ip4| {
@@ -25,7 +27,7 @@ pub fn resolve(hostname: []const u8, port: u16) !net.Address {
     defer list.deinit();
 
     if (list.addrs.len == 0) {
-        return error.DnsResolutionFailed;
+        return HttpError.DnsResolutionFailed;
     }
 
     return list.addrs[0];

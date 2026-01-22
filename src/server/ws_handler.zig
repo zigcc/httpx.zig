@@ -29,6 +29,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 const ws = @import("../protocol/websocket.zig");
+const HttpError = @import("../core/types.zig").HttpError;
 const Socket = @import("../net/socket.zig").Socket;
 const Headers = @import("../core/headers.zig").Headers;
 const HeaderName = @import("../core/headers.zig").HeaderName;
@@ -97,7 +98,7 @@ pub const WebSocketConnection = struct {
     /// Uses stack buffer for small messages to avoid allocation.
     pub fn send(self: *Self, data: []const u8, opcode: ws.Opcode) !void {
         if (self.state != .open and self.state != .closing) {
-            return error.ConnectionNotOpen;
+            return HttpError.ConnectionNotOpen;
         }
 
         const frame = ws.Frame{
@@ -204,7 +205,7 @@ pub const WebSocketConnection = struct {
 
             if (n == 0) {
                 self.state = .closed;
-                return error.ConnectionClosed;
+                return HttpError.ConnectionClosed;
             }
 
             try self.frame_reader.feed(buf[0..n]);
