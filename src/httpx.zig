@@ -197,6 +197,17 @@ pub const QuicCryptoFrame = quic.CryptoFrame;
 pub const QuicAckFrame = quic.AckFrame;
 pub const QuicTransportParameters = quic.TransportParameters;
 
+// WebSocket exports
+pub const WebSocketClient = ws_client.WebSocketClient;
+pub const WebSocketConnection = ws_handler.WebSocketConnection;
+pub const WebSocketHandler = ws_handler.WebSocketHandler;
+pub const WebSocketOptions = ws_client.WebSocketOptions;
+pub const WebSocketMessage = ws_client.Message;
+pub const WsOpcode = websocket.Opcode;
+pub const WsFrame = websocket.Frame;
+pub const WsCloseCode = websocket.CloseCode;
+pub const isWebSocketUpgrade = ws_handler.isUpgradeRequest;
+
 pub const formatRequest = http.formatRequest;
 pub const formatResponse = http.formatResponse;
 pub const negotiateVersion = http.negotiateVersion;
@@ -240,17 +251,6 @@ pub const PercentEncoding = encoding.PercentEncoding;
 
 pub const TlsConfig = tls.TlsConfig;
 pub const TlsSession = tls.TlsSession;
-
-// WebSocket exports
-pub const WebSocketClient = ws_client.WebSocketClient;
-pub const WebSocketConnection = ws_handler.WebSocketConnection;
-pub const WebSocketHandler = ws_handler.WebSocketHandler;
-pub const WebSocketOptions = ws_client.WebSocketOptions;
-pub const WebSocketMessage = ws_client.Message;
-pub const WsOpcode = websocket.Opcode;
-pub const WsFrame = websocket.Frame;
-pub const WsCloseCode = websocket.CloseCode;
-pub const isWebSocketUpgrade = ws_handler.isUpgradeRequest;
 
 /// Executes all requests in parallel and returns a result per request.
 pub fn all(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {

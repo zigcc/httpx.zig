@@ -22,6 +22,7 @@ pub const Method = enum {
     TRACE,
     CONNECT,
     CUSTOM,
+    // NOTE: in the production code, we should not enable trace
 
     /// Converts the method to its canonical string representation.
     pub fn toString(self: Method) []const u8 {
@@ -39,21 +40,22 @@ pub const Method = enum {
         };
     }
 
+    const methods = [_]struct { name: []const u8, method: Method }{
+        .{ .name = "GET", .method = .GET },
+        .{ .name = "POST", .method = .POST },
+        .{ .name = "PUT", .method = .PUT },
+        .{ .name = "DELETE", .method = .DELETE },
+        .{ .name = "PATCH", .method = .PATCH },
+        .{ .name = "HEAD", .method = .HEAD },
+        .{ .name = "OPTIONS", .method = .OPTIONS },
+        .{ .name = "TRACE", .method = .TRACE },
+        .{ .name = "CONNECT", .method = .CONNECT },
+    };
+
     /// Parses a string into a Method enum value.
     /// Returns null for unrecognized method strings.
     pub fn fromString(str: []const u8) ?Method {
-        const methods = [_]struct { name: []const u8, method: Method }{
-            .{ .name = "GET", .method = .GET },
-            .{ .name = "POST", .method = .POST },
-            .{ .name = "PUT", .method = .PUT },
-            .{ .name = "DELETE", .method = .DELETE },
-            .{ .name = "PATCH", .method = .PATCH },
-            .{ .name = "HEAD", .method = .HEAD },
-            .{ .name = "OPTIONS", .method = .OPTIONS },
-            .{ .name = "TRACE", .method = .TRACE },
-            .{ .name = "CONNECT", .method = .CONNECT },
-        };
-        for (methods) |m| {
+        inline for (methods) |m| {
             if (std.mem.eql(u8, str, m.name)) return m.method;
         }
         return null;
@@ -126,6 +128,7 @@ pub const Version = enum {
     }
 
     /// Returns true if the version supports server push.
+    /// Note: HTTP/3 spec includes server push but major browsers disabled it.
     pub fn supportsServerPush(self: Version) bool {
         return self == .HTTP_2;
     }
