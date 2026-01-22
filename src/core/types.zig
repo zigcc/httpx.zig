@@ -240,58 +240,133 @@ pub const HttpError = error{
 
 /// Common MIME content types for HTTP messages.
 pub const ContentType = enum {
+    // Text types
     text_plain,
     text_html,
     text_css,
     text_javascript,
+    text_xml,
+    text_csv,
+    text_markdown,
+
+    // Application types
     application_json,
     application_xml,
     application_octet_stream,
     application_form_urlencoded,
+    application_pdf,
+    application_zip,
+    application_gzip,
+
+    // Multipart types
     multipart_form_data,
+
+    // Image types
     image_png,
     image_jpeg,
     image_gif,
     image_webp,
     image_svg,
 
+    // Video types
+    video_mp4,
+    video_webm,
+
+    // Audio types
+    audio_mpeg,
+    audio_wav,
+
+    // Font types
+    font_woff,
+    font_woff2,
+
     /// Returns the MIME type string.
     pub fn toString(self: ContentType) []const u8 {
         return switch (self) {
+            // Text types
             .text_plain => "text/plain",
             .text_html => "text/html",
             .text_css => "text/css",
             .text_javascript => "text/javascript",
+            .text_xml => "text/xml",
+            .text_csv => "text/csv",
+            .text_markdown => "text/markdown",
+
+            // Application types
             .application_json => "application/json",
             .application_xml => "application/xml",
             .application_octet_stream => "application/octet-stream",
             .application_form_urlencoded => "application/x-www-form-urlencoded",
+            .application_pdf => "application/pdf",
+            .application_zip => "application/zip",
+            .application_gzip => "application/gzip",
+
+            // Multipart types
             .multipart_form_data => "multipart/form-data",
+
+            // Image types
             .image_png => "image/png",
             .image_jpeg => "image/jpeg",
             .image_gif => "image/gif",
             .image_webp => "image/webp",
             .image_svg => "image/svg+xml",
+
+            // Video types
+            .video_mp4 => "video/mp4",
+            .video_webm => "video/webm",
+
+            // Audio types
+            .audio_mpeg => "audio/mpeg",
+            .audio_wav => "audio/wav",
+
+            // Font types
+            .font_woff => "font/woff",
+            .font_woff2 => "font/woff2",
         };
     }
 
     /// Parses a MIME type string into a ContentType enum.
     pub fn fromString(str: []const u8) ?ContentType {
         const types = [_]struct { name: []const u8, ct: ContentType }{
+            // Text types
             .{ .name = "text/plain", .ct = .text_plain },
             .{ .name = "text/html", .ct = .text_html },
             .{ .name = "text/css", .ct = .text_css },
             .{ .name = "text/javascript", .ct = .text_javascript },
+            .{ .name = "text/xml", .ct = .text_xml },
+            .{ .name = "text/csv", .ct = .text_csv },
+            .{ .name = "text/markdown", .ct = .text_markdown },
+
+            // Application types
             .{ .name = "application/json", .ct = .application_json },
             .{ .name = "application/xml", .ct = .application_xml },
             .{ .name = "application/octet-stream", .ct = .application_octet_stream },
             .{ .name = "application/x-www-form-urlencoded", .ct = .application_form_urlencoded },
+            .{ .name = "application/pdf", .ct = .application_pdf },
+            .{ .name = "application/zip", .ct = .application_zip },
+            .{ .name = "application/gzip", .ct = .application_gzip },
+
+            // Multipart types
             .{ .name = "multipart/form-data", .ct = .multipart_form_data },
+
+            // Image types
             .{ .name = "image/png", .ct = .image_png },
             .{ .name = "image/jpeg", .ct = .image_jpeg },
             .{ .name = "image/gif", .ct = .image_gif },
             .{ .name = "image/webp", .ct = .image_webp },
             .{ .name = "image/svg+xml", .ct = .image_svg },
+
+            // Video types
+            .{ .name = "video/mp4", .ct = .video_mp4 },
+            .{ .name = "video/webm", .ct = .video_webm },
+
+            // Audio types
+            .{ .name = "audio/mpeg", .ct = .audio_mpeg },
+            .{ .name = "audio/wav", .ct = .audio_wav },
+
+            // Font types
+            .{ .name = "font/woff", .ct = .font_woff },
+            .{ .name = "font/woff2", .ct = .font_woff2 },
         };
         for (types) |t| {
             if (std.mem.startsWith(u8, str, t.name)) return t.ct;
