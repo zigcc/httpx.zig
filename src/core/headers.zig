@@ -205,7 +205,7 @@ pub const Headers = struct {
     /// Returns true if Transfer-Encoding includes chunked.
     pub fn isChunked(self: *const Self) bool {
         const value = self.get(HeaderName.TRANSFER_ENCODING) orelse return false;
-        return mem.indexOf(u8, value, "chunked") != null;
+        return mem.indexOf(u8, value, types.TransferEncoding.chunked.toString()) != null;
     }
 
     /// Determines if connection should be kept alive based on headers and version.

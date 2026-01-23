@@ -308,7 +308,7 @@ pub const Parser = struct {
             if (std.ascii.eqlIgnoreCase(name, "content-length")) {
                 self.content_length = std.fmt.parseInt(u64, value, 10) catch null;
             } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-                if (mem.indexOf(u8, value, "chunked") != null) {
+                if (mem.indexOf(u8, value, types.TransferEncoding.chunked.toString()) != null) {
                     self.chunked = true;
                 }
             }
