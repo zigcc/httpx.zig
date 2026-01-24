@@ -1,12 +1,6 @@
-//! HTTP Response Representation for httpx.zig
+//! HTTP Response for httpx.zig Server
 //!
-//! Provides the Response structure and ResponseBuilder for handling
-//! HTTP responses. Features include:
-//!
-//! - Status code and reason phrase management
-//! - Header access with common helpers
-//! - Body handling with JSON parsing support
-//! - Response building for servers
+//! Provides Response and ResponseBuilder for server-side HTTP responses.
 
 const std = @import("std");
 const mem = std.mem;
@@ -45,57 +39,6 @@ pub const Response = struct {
                 self.allocator.free(b);
             }
         }
-    }
-
-    /// Returns true if the response indicates success (2xx).
-    pub fn ok(self: *const Self) bool {
-        return self.status.isSuccess();
-    }
-
-    /// Returns true if the response is a redirect (3xx).
-    pub fn isRedirect(self: *const Self) bool {
-        return self.status.isRedirect();
-    }
-
-    /// Returns true if the response is an error (4xx or 5xx).
-    pub fn isError(self: *const Self) bool {
-        return self.status.isError();
-    }
-
-    /// Returns the response body as text.
-    pub fn text(self: *const Self) ?[]const u8 {
-        return self.body;
-    }
-
-    /// Parses the response body as JSON into the given type.
-    pub fn json(self: *const Self, comptime T: type) !T {
-        const body = self.body orelse return error.NoBody;
-        return std.json.parseFromSlice(T, self.allocator, body, .{});
-    }
-
-    /// Returns the Location header value for redirects.
-    pub fn location(self: *const Self) ?[]const u8 {
-        return self.headers.get(HeaderName.LOCATION);
-    }
-
-    /// Returns the Content-Type header value.
-    pub fn contentType(self: *const Self) ?[]const u8 {
-        return self.headers.get(HeaderName.CONTENT_TYPE);
-    }
-
-    /// Returns the Content-Length header value.
-    pub fn contentLength(self: *const Self) ?u64 {
-        return self.headers.getContentLength();
-    }
-
-    /// Returns true if the response uses chunked transfer encoding.
-    pub fn isChunked(self: *const Self) bool {
-        return self.headers.isChunked();
-    }
-
-    /// Returns a specific header value.
-    pub fn header(self: *const Self, name: []const u8) ?[]const u8 {
-        return self.headers.get(name);
     }
 
     /// Serializes the response to HTTP/1.1 wire format.
@@ -211,25 +154,7 @@ test "Response initialization" {
     var response = Response.init(allocator, 200);
     defer response.deinit();
 
-    try std.testing.expect(response.ok());
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
-}
-
-test "Response status checks" {
-    const allocator = std.testing.allocator;
-
-    var ok = Response.init(allocator, 200);
-    defer ok.deinit();
-    try std.testing.expect(ok.ok());
-    try std.testing.expect(!ok.isError());
-
-    var redirect = Response.init(allocator, 301);
-    defer redirect.deinit();
-    try std.testing.expect(redirect.isRedirect());
-
-    var error_resp = Response.init(allocator, 404);
-    defer error_resp.deinit();
-    try std.testing.expect(error_resp.isError());
 }
 
 test "ResponseBuilder" {
