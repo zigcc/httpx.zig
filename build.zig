@@ -15,22 +15,17 @@ pub fn build(b: *std.Build) void {
     });
 
     const examples = [_]struct { name: []const u8, path: []const u8, skip_run_all: bool = false }{
-        .{ .name = "simple_get", .path = "examples/simple_get.zig" },
         .{ .name = "post_json", .path = "examples/post_json.zig" },
-        .{ .name = "concurrent_requests", .path = "examples/concurrent_requests.zig" },
         .{ .name = "custom_headers", .path = "examples/custom_headers.zig" },
         .{ .name = "udp_local", .path = "examples/udp_local.zig" },
         .{ .name = "simple_server", .path = "examples/simple_server.zig", .skip_run_all = true },
         .{ .name = "router_example", .path = "examples/router_example.zig", .skip_run_all = true },
         .{ .name = "middleware_example", .path = "examples/middleware_example.zig", .skip_run_all = true },
         .{ .name = "streaming", .path = "examples/streaming.zig" },
-        .{ .name = "interceptors", .path = "examples/interceptors.zig" },
-        .{ .name = "connection_pool", .path = "examples/connection_pool.zig" },
         .{ .name = "static_files", .path = "examples/static_files.zig", .skip_run_all = true },
         .{ .name = "http2_example", .path = "examples/http2_example.zig" },
         .{ .name = "http3_example", .path = "examples/http3_example.zig" },
         .{ .name = "websocket_server", .path = "examples/websocket_server.zig", .skip_run_all = true },
-        .{ .name = "websocket_client", .path = "examples/websocket_client.zig", .skip_run_all = true },
         .{ .name = "threaded_server", .path = "examples/threaded_server.zig", .skip_run_all = true },
     };
 

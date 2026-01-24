@@ -2,18 +2,17 @@
 
 This is a fork of https://github.com/muhammad-fiaz/httpx.zig !
 
-**httpx.zig** is a production-ready, high-performance HTTP client and server library for the Zig programming language, designed for building modern, robust, and scalable networked applications.
+**httpx.zig** is a production-ready, high-performance HTTP server library for the Zig programming language, designed for building modern, robust, and scalable networked applications.
 
 ---
 
 ## Features
 
 - **Comprehensive HTTP Support**: Full implementation of HTTP/1.1, HTTP/2, and experimental HTTP/3.
-- **Client & Server**: Includes both a high-level client and a flexible server implementation.
-- **WebSocket API**: Full-featured client and server WebSocket support.
+- **WebSocket Server**: Full-featured WebSocket support (RFC 6455).
 - **Asynchronous Core**: Built for high-concurrency and non-blocking I/O.
 - **TLS/SSL**: Integrated TLS support for secure connections.
-- **Extensible**: Support for middleware and interceptors to customize request/response handling.
+- **Extensible**: Support for middleware to customize request/response handling.
 - **Modern Zig API**: Designed with a focus on clarity, safety, and performance.
 
 ## Installation
@@ -43,37 +42,28 @@ exe.addModule("httpx", httpx_module);
 
 ## Quick Start
 
-Here is a simple example of making a GET request:
+Here is a simple example of creating an HTTP server:
 
 ```zig
 const std = @import("std");
 const httpx = @import("httpx");
+
+fn handleHello(ctx: *httpx.Context) !void {
+    try ctx.json(.{ .message = "Hello, World!" }, .{});
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Initialize the client
-    var client = httpx.Client.init(allocator);
-    defer client.deinit();
+    var server = try httpx.Server.init(allocator, .{ .port = 8080 });
+    defer server.deinit();
 
-    // Create a new GET request
-    var request = try httpx.Request.init(allocator, .GET, "https://httpbin.org/get");
-    defer request.deinit();
+    try server.get("/hello", handleHello);
 
-    // Add custom headers
-    try request.headers.set("Accept", "application/json");
-    try request.headers.set("User-Agent", "httpx.zig/1.0");
-
-    // Send the request and get the response
-    var response = try client.send(&request);
-    defer response.deinit();
-
-    // Print response details
-    std.debug.print("Status: {}\n", .{response.status});
-    const body = try response.body_string();
-    std.debug.print("Body: {s}\n", .{body});
+    std.debug.print("Server listening on http://localhost:8080\n", .{});
+    try server.listen();
 }
 ```
 
@@ -81,12 +71,11 @@ pub fn main() !void {
 
 The library is structured into several key components:
 
-- `httpx.Client`: A high-level client for sending HTTP requests.
 - `httpx.Server`: A server for handling incoming HTTP connections.
 - `httpx.Request`: Represents an HTTP request.
 - `httpx.Response`: Represents an HTTP response.
 - `httpx.Router`: A flexible router for mapping paths to handlers in the server.
-- `httpx.websocket`: Provides WebSocket client and server functionality.
+- `httpx.WebSocketConnection`: Server-side WebSocket connection handler.
 
 ## License
 
