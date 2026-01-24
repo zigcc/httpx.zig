@@ -100,7 +100,16 @@ pub const websocket = @import("protocol/websocket.zig");
 pub const socket = @import("net/socket.zig");
 pub const address = @import("net/address.zig");
 
+// I/O subsystem for event-driven programming
+pub const io = struct {
+    pub const poller = @import("io/poller.zig");
+    pub const Poller = poller.Poller;
+    pub const Event = poller.Event;
+    pub const EventMask = poller.EventMask;
+};
+
 pub const tls = @import("tls/tls.zig");
+pub const tls_session_pool = @import("tls/session_pool.zig");
 
 pub const client_mod = @import("client/client.zig");
 pub const pool = @import("client/pool.zig");
@@ -111,6 +120,7 @@ pub const middleware = @import("server/middleware.zig");
 pub const ws_handler = @import("server/ws_handler.zig");
 pub const ws_client = @import("client/ws_client.zig");
 pub const worker_pool = @import("server/worker_pool.zig");
+pub const event_server = @import("server/event_server.zig");
 
 pub const buffer = @import("util/buffer.zig");
 pub const encoding = @import("util/encoding.zig");
@@ -242,6 +252,12 @@ pub const WorkerPool = server_mod.WorkerPool;
 pub const WorkerPoolConfig = server_mod.WorkerPoolConfig;
 pub const WorkItem = server_mod.WorkItem;
 
+// Event-driven server for high concurrency
+pub const EventServer = event_server.EventServer;
+pub const EventServerConfig = event_server.EventServerConfig;
+pub const EventConnection = event_server.Connection;
+pub const EventConnectionState = event_server.ConnectionState;
+
 pub const Router = router.Router;
 pub const RouteGroup = router.RouteGroup;
 pub const RouteMatch = router.RouteMatch;
@@ -265,6 +281,9 @@ pub const PercentEncoding = encoding.PercentEncoding;
 
 pub const TlsConfig = tls.TlsConfig;
 pub const TlsSession = tls.TlsSession;
+pub const TlsSessionPool = tls_session_pool.TlsSessionPool;
+pub const TlsSessionPoolConfig = tls_session_pool.TlsSessionPoolConfig;
+pub const TlsSessionTicket = tls_session_pool.TlsSessionTicket;
 
 /// Executes all requests in parallel and returns a result per request.
 pub fn all(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
@@ -415,4 +434,16 @@ test "socket" {
 
 test "address" {
     _ = address;
+}
+
+test "io poller" {
+    _ = io.poller;
+}
+
+test "tls session pool" {
+    _ = tls_session_pool;
+}
+
+test "event server" {
+    _ = event_server;
 }

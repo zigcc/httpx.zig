@@ -318,6 +318,39 @@ pub const Socket = struct {
         try posix.setsockopt(self.handle, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&value));
     }
 
+    /// Sets the socket to non-blocking mode.
+    /// This is required for use with event pollers (epoll/kqueue/IOCP).
+    pub fn setNonBlocking(self: *Self, enable: bool) !void {
+        if (is_windows) {
+            // Windows: use ioctlsocket with FIONBIO
+            const ws2_32 = std.os.windows.ws2_32;
+            var mode: c_ulong = if (enable) 1 else 0;
+            if (ws2_32.ioctlsocket(self.handle, ws2_32.FIONBIO, &mode) != 0) {
+                return error.SetNonBlockingFailed;
+            }
+        } else {
+            // POSIX: use fcntl with O_NONBLOCK
+            const current_flags = try posix.fcntl(self.handle, .F_GETFL, 0);
+            const new_flags = if (enable)
+                current_flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))
+            else
+                current_flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+            _ = try posix.fcntl(self.handle, .F_SETFL, new_flags);
+        }
+    }
+
+    /// Returns true if the socket is in non-blocking mode.
+    pub fn isNonBlocking(self: *Self) !bool {
+        if (is_windows) {
+            // Windows doesn't provide a way to query non-blocking status
+            // Return false as a safe default
+            return false;
+        } else {
+            const flags = try posix.fcntl(self.handle, .F_GETFL, 0);
+            return (flags & @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))) != 0;
+        }
+    }
+
     /// Binds the socket to an address.
     pub fn bind(self: *Self, addr: net.Address) !void {
         try posix.bind(self.handle, &addr.any, addr.getOsSockLen());
@@ -551,6 +584,25 @@ pub const UdpSocket = struct {
                 .usec = @intCast((ms % 1000) * 1000),
             };
             try posix.setsockopt(self.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+        }
+    }
+
+    /// Sets the socket to non-blocking mode.
+    /// This is required for use with event pollers (epoll/kqueue/IOCP).
+    pub fn setNonBlocking(self: *Self, enable: bool) !void {
+        if (is_windows) {
+            const ws2_32 = std.os.windows.ws2_32;
+            var mode: c_ulong = if (enable) 1 else 0;
+            if (ws2_32.ioctlsocket(self.handle, ws2_32.FIONBIO, &mode) != 0) {
+                return error.SetNonBlockingFailed;
+            }
+        } else {
+            const current_flags = try posix.fcntl(self.handle, .F_GETFL, 0);
+            const new_flags = if (enable)
+                current_flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))
+            else
+                current_flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+            _ = try posix.fcntl(self.handle, .F_SETFL, new_flags);
         }
     }
 
