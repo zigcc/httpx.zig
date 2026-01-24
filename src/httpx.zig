@@ -89,6 +89,11 @@ pub const status = @import("core/status.zig");
 pub const request = @import("core/request.zig");
 pub const response = @import("core/response.zig");
 
+// New HTTP/1.1 feature modules
+pub const cookie = @import("core/cookie.zig");
+pub const auth = @import("core/auth.zig");
+pub const multipart_mod = @import("core/multipart.zig");
+
 pub const http = @import("protocol/http.zig");
 pub const parser = @import("protocol/parser.zig");
 pub const hpack = @import("protocol/hpack.zig");
@@ -125,6 +130,9 @@ pub const event_server = @import("server/event_server.zig");
 pub const buffer = @import("util/buffer.zig");
 pub const encoding = @import("util/encoding.zig");
 pub const json = @import("util/json.zig");
+pub const compression_mod = @import("util/compression.zig");
+
+pub const proxy = @import("client/proxy.zig");
 
 pub const executor = @import("concurrency/executor.zig");
 pub const concurrency = @import("concurrency/pool.zig");
@@ -284,6 +292,38 @@ pub const TlsSession = tls.TlsSession;
 pub const TlsSessionPool = tls_session_pool.TlsSessionPool;
 pub const TlsSessionPoolConfig = tls_session_pool.TlsSessionPoolConfig;
 pub const TlsSessionTicket = tls_session_pool.TlsSessionTicket;
+
+// Cookie management (RFC 6265)
+pub const Cookie = cookie.Cookie;
+pub const CookieJar = cookie.CookieJar;
+pub const SameSite = cookie.SameSite;
+pub const parseSetCookie = cookie.parseSetCookie;
+
+// Authentication (RFC 7617, RFC 7616, RFC 6750)
+pub const AuthScheme = auth.AuthScheme;
+pub const Credentials = auth.Credentials;
+pub const Authenticator = auth.Authenticator;
+pub const basicAuthHeader = auth.basicAuth;
+pub const bearerAuthHeader = auth.bearerAuth;
+pub const digestAuth = auth.digestAuth;
+pub const DigestChallenge = auth.DigestChallenge;
+
+// Multipart form data (RFC 2046)
+pub const MultipartForm = multipart_mod.MultipartForm;
+pub const UrlEncodedForm = multipart_mod.UrlEncodedForm;
+pub const MimeType = multipart_mod.MimeType;
+
+// Content-Encoding compression (RFC 7231)
+pub const Compression = compression_mod;
+pub const decompress = compression_mod.decompress;
+pub const compress = compression_mod.compress;
+pub const decompressAuto = compression_mod.decompressAuto;
+
+// HTTP Proxy support
+pub const ProxyConfig = proxy.ProxyConfig;
+pub const ProxyTunnel = proxy.ProxyTunnel;
+pub const ProxyType = proxy.ProxyType;
+pub const parseProxyUrl = proxy.parseProxyUrl;
 
 /// Executes all requests in parallel and returns a result per request.
 pub fn all(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
@@ -446,4 +486,25 @@ test "tls session pool" {
 
 test "event server" {
     _ = event_server;
+}
+
+// New HTTP/1.1 feature tests
+test "cookie" {
+    _ = cookie;
+}
+
+test "auth" {
+    _ = auth;
+}
+
+test "multipart" {
+    _ = multipart_mod;
+}
+
+test "compression" {
+    _ = compression_mod;
+}
+
+test "proxy" {
+    _ = proxy;
 }

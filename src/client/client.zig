@@ -2,6 +2,17 @@
 //!
 //! HTTP/1.1 client over TCP with optional TLS (HTTPS).
 //!
+//! ## Features
+//! - Connection pooling with keep-alive
+//! - Automatic retry with exponential backoff
+//! - Redirect following with configurable policies
+//! - Request/response interceptors
+//! - Automatic cookie management (CookieJar)
+//! - Content-Encoding decompression (gzip, deflate)
+//! - Basic/Digest/Bearer authentication
+//! - HTTP proxy support with CONNECT tunneling
+//! - Multipart form data uploads
+//!
 //! Notes:
 //! - HTTP/2 and HTTP/3 types exist in `src/protocol/http.zig`, but this client
 //!   currently speaks HTTP/1.1.
@@ -30,6 +41,13 @@ const TlsConfig = @import("../tls/tls.zig").TlsConfig;
 const TlsSession = @import("../tls/tls.zig").TlsSession;
 const ConnectionPool = @import("pool.zig").ConnectionPool;
 
+// New feature imports
+const CookieJar = @import("../core/cookie.zig").CookieJar;
+const compression = @import("../util/compression.zig");
+const auth_mod = @import("../core/auth.zig");
+const proxy_mod = @import("proxy.zig");
+const multipart = @import("../core/multipart.zig");
+
 /// Client error type - combines HTTP errors with system/network errors.
 pub const ClientError = HttpError || Allocator.Error || std.posix.ConnectError || std.posix.SetSockOptError || std.posix.SendError || std.posix.RecvError || ParseError;
 
@@ -49,6 +67,20 @@ pub const ClientConfig = struct {
     keep_alive: bool = true,
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
+
+    // New HTTP/1.1 features
+    /// Enable automatic cookie management
+    enable_cookies: bool = true,
+    /// Enable automatic Content-Encoding decompression
+    auto_decompress: bool = true,
+    /// Send Accept-Encoding header for compression
+    accept_encoding: bool = true,
+    /// HTTP proxy configuration
+    proxy: ?proxy_mod.ProxyConfig = null,
+    /// Basic authentication credentials (username, password)
+    basic_auth: ?struct { username: []const u8, password: []const u8 } = null,
+    /// Bearer token for authentication
+    bearer_token: ?[]const u8 = null,
 };
 
 /// Per-request options.
@@ -58,6 +90,16 @@ pub const RequestOptions = struct {
     json: ?[]const u8 = null,
     timeout_ms: ?u64 = null,
     follow_redirects: ?bool = null,
+    /// Basic auth for this request only
+    basic_auth: ?struct { username: []const u8, password: []const u8 } = null,
+    /// Bearer token for this request only
+    bearer_token: ?[]const u8 = null,
+    /// Multipart form data
+    multipart_form: ?*multipart.MultipartForm = null,
+    /// URL-encoded form data
+    form_data: ?*multipart.UrlEncodedForm = null,
+    /// Skip automatic decompression for this request
+    skip_decompress: bool = false,
 };
 
 /// Request interceptor function type.
@@ -78,8 +120,9 @@ pub const Client = struct {
     allocator: Allocator,
     config: ClientConfig,
     interceptors: std.ArrayListUnmanaged(Interceptor) = .empty,
-    cookies: std.StringHashMapUnmanaged([]const u8) = .{},
+    cookie_jar: CookieJar,
     pool: ConnectionPool,
+    authenticator: auth_mod.Authenticator,
 
     const Self = @This();
 
@@ -90,26 +133,40 @@ pub const Client = struct {
 
     /// Creates a new HTTP client with custom configuration.
     pub fn initWithConfig(allocator: Allocator, config: ClientConfig) Self {
-        return .{
+        var client = Self{
             .allocator = allocator,
             .config = config,
             .pool = ConnectionPool.initWithConfig(allocator, .{
                 .max_connections = config.pool_max_connections,
                 .max_per_host = config.pool_max_per_host,
             }),
+            .cookie_jar = CookieJar.init(allocator),
+            .authenticator = auth_mod.Authenticator.init(allocator),
         };
+
+        // Set up basic auth if configured
+        if (config.basic_auth) |ba| {
+            client.authenticator.setCredentials(ba.username, ba.password);
+        }
+
+        return client;
     }
 
     /// Releases all allocated resources.
     pub fn deinit(self: *Self) void {
         self.interceptors.deinit(self.allocator);
-        var it = self.cookies.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.cookies.deinit(self.allocator);
+        self.cookie_jar.deinit();
         self.pool.deinit();
+    }
+
+    /// Gets the cookie jar for manual cookie management.
+    pub fn getCookieJar(self: *Self) *CookieJar {
+        return &self.cookie_jar;
+    }
+
+    /// Sets basic authentication credentials.
+    pub fn setBasicAuth(self: *Self, username: []const u8, password: []const u8) void {
+        self.authenticator.setCredentials(username, password);
     }
 
     /// Adds an interceptor to the client.
@@ -133,42 +190,109 @@ pub const Client = struct {
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
 
+        // Set User-Agent
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
+        // Add Accept-Encoding header for automatic decompression
+        if (self.config.accept_encoding and self.config.auto_decompress) {
+            try req.headers.set(HeaderName.ACCEPT_ENCODING, compression.acceptEncodingHeader());
+        }
+
+        // Add default headers
         if (self.config.default_headers) |hdrs| {
             for (hdrs) |h| {
                 try req.headers.set(h[0], h[1]);
             }
         }
 
+        // Add request-specific headers
         if (reqOpts.headers) |hdrs| {
             for (hdrs) |h| {
                 try req.headers.set(h[0], h[1]);
             }
         }
 
-        if (reqOpts.body) |body| {
-            try req.setBody(body);
+        // Handle authentication
+        if (reqOpts.bearer_token orelse self.config.bearer_token) |token| {
+            const auth_header = try auth_mod.bearerAuth(self.allocator, token);
+            defer self.allocator.free(auth_header);
+            try req.headers.set("Authorization", auth_header);
+        } else if (reqOpts.basic_auth) |ba| {
+            const auth_header = try auth_mod.basicAuth(self.allocator, ba.username, ba.password);
+            defer self.allocator.free(auth_header);
+            try req.headers.set("Authorization", auth_header);
+        } else if (self.authenticator.credentials != null) {
+            if (try self.authenticator.getAuthHeader(method.toString(), req.uri.path)) |auth_header| {
+                defer self.allocator.free(auth_header);
+                try req.headers.set("Authorization", auth_header);
+            }
         }
 
-        if (reqOpts.json) |json_body| {
+        // Add cookies from cookie jar
+        if (self.config.enable_cookies) {
+            if (req.uri.host) |host| {
+                const is_secure = req.uri.isTls();
+                if (try self.cookie_jar.getCookieHeader(self.allocator, host, req.uri.path, is_secure)) |cookie_header| {
+                    defer self.allocator.free(cookie_header);
+                    try req.headers.set(HeaderName.COOKIE, cookie_header);
+                }
+            }
+        }
+
+        // Handle body content
+        if (reqOpts.multipart_form) |form| {
+            // Multipart form data
+            const body = try form.encode();
+            defer self.allocator.free(body);
+            req.body = try self.allocator.dupe(u8, body);
+            req.body_owned = true;
+            const ct = try form.getContentTypeHeader(self.allocator);
+            defer self.allocator.free(ct);
+            try req.headers.set(HeaderName.CONTENT_TYPE, ct);
+            var len_buf: [32]u8 = undefined;
+            const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body.len}) catch unreachable;
+            try req.headers.set(HeaderName.CONTENT_LENGTH, len_str);
+        } else if (reqOpts.form_data) |form| {
+            // URL-encoded form data
+            const body = try form.encode();
+            defer self.allocator.free(body);
+            req.body = try self.allocator.dupe(u8, body);
+            req.body_owned = true;
+            try req.headers.set(HeaderName.CONTENT_TYPE, multipart.UrlEncodedForm.contentType());
+            var len_buf: [32]u8 = undefined;
+            const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body.len}) catch unreachable;
+            try req.headers.set(HeaderName.CONTENT_LENGTH, len_str);
+        } else if (reqOpts.body) |body| {
+            try req.setBody(body);
+        } else if (reqOpts.json) |json_body| {
             try req.setJson(json_body);
         }
 
+        // Run request interceptors
         for (self.interceptors.items) |interceptor| {
             if (interceptor.request_fn) |f| {
                 try f(&req, interceptor.context);
             }
         }
 
-        var response = try self.executeRequest(&req);
+        // Execute request
+        var response = try self.executeRequest(&req, reqOpts.skip_decompress);
 
+        // Process Set-Cookie headers
+        if (self.config.enable_cookies) {
+            if (req.uri.host) |host| {
+                try self.cookie_jar.processResponse(response.headers, host);
+            }
+        }
+
+        // Run response interceptors
         for (self.interceptors.items) |interceptor| {
             if (interceptor.response_fn) |f| {
                 try f(&response, interceptor.context);
             }
         }
 
+        // Handle redirects
         const should_follow = reqOpts.follow_redirects orelse self.config.follow_redirects;
         if (should_follow and response.isRedirect()) {
             if (depth >= self.config.redirect_policy.max_redirects) {
@@ -189,11 +313,18 @@ pub const Client = struct {
             return self.requestInternal(next_method, next_url, reqOpts, depth + 1);
         }
 
+        // Handle 401 Unauthorized - extract challenge for Digest auth
+        if (response.status.code == 401) {
+            if (response.headers.get("WWW-Authenticate")) |www_auth| {
+                self.authenticator.handleChallenge(www_auth);
+            }
+        }
+
         return response;
     }
 
     /// Executes the actual HTTP request.
-    fn executeRequest(self: *Self, req: *Request) ClientError!Response {
+    fn executeRequest(self: *Self, req: *Request, skip_decompress: bool) ClientError!Response {
         const policy = self.config.retry_policy;
         const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
 
@@ -215,6 +346,25 @@ pub const Client = struct {
                 const delay_ms = policy.calculateDelay(attempt);
                 if (delay_ms > 0) std.time.sleep(delay_ms * std.time.ns_per_ms);
                 continue;
+            }
+
+            // Auto-decompress response body if enabled
+            if (self.config.auto_decompress and !skip_decompress and res.body != null) {
+                const content_encoding = res.headers.get(HeaderName.CONTENT_ENCODING);
+                if (content_encoding != null) {
+                    if (compression.decompressAuto(self.allocator, res.body.?, content_encoding)) |decompressed| {
+                        // Replace body with decompressed data
+                        if (res.body_owned) {
+                            self.allocator.free(res.body.?);
+                        }
+                        res.body = decompressed;
+                        res.body_owned = true;
+                        // Remove Content-Encoding header as body is now decompressed
+                        res.headers.removeAll(HeaderName.CONTENT_ENCODING);
+                    } else |_| {
+                        // Decompression failed, keep original body
+                    }
+                }
             }
 
             return res;

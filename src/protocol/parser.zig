@@ -51,6 +51,7 @@ pub const Parser = struct {
     version: types.Version = .HTTP_1_1,
     status_code: ?u16 = null,
     headers: Headers,
+    trailer_headers: Headers,
     body_buffer: std.ArrayListUnmanaged(u8) = .empty,
     content_length: ?u64 = null,
     chunked: bool = false,
@@ -74,6 +75,7 @@ pub const Parser = struct {
         return .{
             .allocator = allocator,
             .headers = Headers.init(allocator),
+            .trailer_headers = Headers.init(allocator),
         };
     }
 
@@ -88,6 +90,7 @@ pub const Parser = struct {
     /// Releases all allocated memory.
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
+        self.trailer_headers.deinit();
         self.body_buffer.deinit(self.allocator);
         self.line_buffer.deinit(self.allocator);
         if (self.path) |p| self.allocator.free(p);
@@ -161,6 +164,7 @@ pub const Parser = struct {
         }
         self.status_code = null;
         self.headers.clear();
+        self.trailer_headers.clear();
         self.body_buffer.clearRetainingCapacity();
         self.line_buffer.clearRetainingCapacity();
         self.content_length = null;
@@ -170,6 +174,11 @@ pub const Parser = struct {
         self.chunk_crlf_read = 0;
         self.header_bytes = 0;
         self.header_count = 0;
+    }
+
+    /// Returns the parsed trailer headers (from chunked encoding).
+    pub fn getTrailerHeaders(self: *const Self) *const Headers {
+        return &self.trailer_headers;
     }
 
     fn checkLineBufferLimit(self: *Self) ParseError!void {
@@ -456,17 +465,63 @@ pub const Parser = struct {
             break :blk self.line_buffer.items;
         } else data[0..line_end];
 
-        // Ignore trailer fields but consume them until the terminating empty line.
+        // Empty line marks end of trailers
         if (line.len == 0) {
             self.line_buffer.clearRetainingCapacity();
             self.state = .complete;
             return line_end + 2;
         }
 
+        // Parse and store trailer headers (RFC 7230 Section 4.1.2)
+        if (mem.indexOf(u8, line, ":")) |sep| {
+            const name = mem.trim(u8, line[0..sep], " \t");
+            const value = mem.trim(u8, line[sep + 1 ..], " \t");
+
+            // Only store allowed trailer headers (not hop-by-hop headers)
+            if (!isHopByHopHeader(name)) {
+                try self.trailer_headers.append(name, value);
+            }
+        }
+
         self.line_buffer.clearRetainingCapacity();
         return line_end + 2;
     }
 };
+
+/// Checks if a header is a hop-by-hop header that should not appear in trailers.
+fn isHopByHopHeader(name: []const u8) bool {
+    const hop_by_hop = [_][]const u8{
+        "Transfer-Encoding",
+        "Content-Length",
+        "Host",
+        "Cache-Control",
+        "Expect",
+        "Max-Forwards",
+        "Pragma",
+        "Range",
+        "TE",
+        "If-Match",
+        "If-None-Match",
+        "If-Modified-Since",
+        "If-Unmodified-Since",
+        "If-Range",
+        "Accept",
+        "Accept-Charset",
+        "Accept-Encoding",
+        "Accept-Language",
+        "Authorization",
+        "Cookie",
+        "Content-Encoding",
+        "Content-Type",
+        "Content-Range",
+        "Trailer",
+    };
+
+    for (hop_by_hop) |h| {
+        if (std.ascii.eqlIgnoreCase(name, h)) return true;
+    }
+    return false;
+}
 
 test "Parser request line" {
     const allocator = std.testing.allocator;
