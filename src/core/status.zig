@@ -136,6 +136,26 @@ pub const Status = struct {
     pub fn mayHaveBody(self: Self) bool {
         return self.code != 204 and self.code != 304 and !self.isInformational();
     }
+
+    /// Returns true if the request can be retried (transient errors).
+    /// Includes: 408 Request Timeout, 429 Too Many Requests, 503 Service Unavailable, 504 Gateway Timeout.
+    pub fn isRetryable(self: Self) bool {
+        return self.code == 408 or self.code == 429 or self.code == 503 or self.code == 504;
+    }
+
+    /// Returns true if the response is cacheable by default per RFC 7231.
+    /// Note: Actual cacheability depends on request method and cache headers.
+    pub fn isCacheable(self: Self) bool {
+        return self.code == 200 or self.code == 203 or self.code == 204 or
+            self.code == 206 or self.code == 300 or self.code == 301 or
+            self.code == 404 or self.code == 405 or self.code == 410 or
+            self.code == 414 or self.code == 501;
+    }
+
+    /// Formats the status as "CODE PHRASE" (e.g., "200 OK").
+    pub fn format(self: Self, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        try writer.print("{d} {s}", .{ self.code, self.phrase });
+    }
 };
 
 /// Returns the standard reason phrase for an HTTP status code.
@@ -236,4 +256,29 @@ test "Status body detection" {
 
     const ok = Status.fromCode(200);
     try std.testing.expect(ok.mayHaveBody());
+}
+
+test "Status retryable" {
+    try std.testing.expect(Status.fromCode(408).isRetryable());
+    try std.testing.expect(Status.fromCode(429).isRetryable());
+    try std.testing.expect(Status.fromCode(503).isRetryable());
+    try std.testing.expect(Status.fromCode(504).isRetryable());
+    try std.testing.expect(!Status.fromCode(500).isRetryable());
+    try std.testing.expect(!Status.fromCode(404).isRetryable());
+}
+
+test "Status cacheable" {
+    try std.testing.expect(Status.fromCode(200).isCacheable());
+    try std.testing.expect(Status.fromCode(301).isCacheable());
+    try std.testing.expect(Status.fromCode(404).isCacheable());
+    try std.testing.expect(!Status.fromCode(201).isCacheable());
+    try std.testing.expect(!Status.fromCode(500).isCacheable());
+}
+
+test "Status format" {
+    const status = Status.fromCode(200);
+    var buf: [32]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try status.format("", .{}, fbs.writer());
+    try std.testing.expectEqualStrings("200 OK", fbs.getWritten());
 }
