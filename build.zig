@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "http3_example", .path = "examples/http3_example.zig" },
         .{ .name = "websocket_server", .path = "examples/websocket_server.zig", .skip_run_all = true },
         .{ .name = "websocket_client", .path = "examples/websocket_client.zig", .skip_run_all = true },
+        .{ .name = "threaded_server", .path = "examples/threaded_server.zig", .skip_run_all = true },
     };
 
     inline for (examples) |example| {

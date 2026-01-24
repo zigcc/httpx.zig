@@ -110,6 +110,7 @@ pub const router = @import("server/router.zig");
 pub const middleware = @import("server/middleware.zig");
 pub const ws_handler = @import("server/ws_handler.zig");
 pub const ws_client = @import("client/ws_client.zig");
+pub const worker_pool = @import("server/worker_pool.zig");
 
 pub const buffer = @import("util/buffer.zig");
 pub const encoding = @import("util/encoding.zig");
@@ -229,11 +230,17 @@ pub const ResponseInterceptor = client_mod.ResponseInterceptor;
 pub const ConnectionPool = pool.ConnectionPool;
 pub const PoolConfig = pool.PoolConfig;
 pub const Connection = pool.Connection;
+pub const PoolStats = pool.PoolStats;
 
 pub const Server = server_mod.Server;
 pub const ServerConfig = server_mod.ServerConfig;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;
+
+// Server worker pool for multi-threading
+pub const WorkerPool = server_mod.WorkerPool;
+pub const WorkerPoolConfig = server_mod.WorkerPoolConfig;
+pub const WorkItem = server_mod.WorkItem;
 
 pub const Router = router.Router;
 pub const RouteGroup = router.RouteGroup;

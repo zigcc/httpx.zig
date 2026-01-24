@@ -7,7 +7,20 @@
 //! - Context-based request handling
 //! - JSON response helpers
 //! - Static file serving
+//! - Multi-threaded request handling (optional)
 //! - Cross-platform (Linux, Windows, macOS)
+//!
+//! ## Multi-Threading
+//!
+//! By default, the server runs in single-threaded mode for simplicity.
+//! Enable multi-threading for production workloads:
+//!
+//! ```zig
+//! var server = Server.init(allocator);
+//! try server.enableThreading(.{ .num_workers = 8 });
+//! try server.get("/hello", helloHandler);
+//! try server.listen();
+//! ```
 
 const std = @import("std");
 const mem = std.mem;
@@ -29,6 +42,12 @@ const Middleware = @import("middleware.zig").Middleware;
 const ws_handler = @import("ws_handler.zig");
 const WebSocketHandler = ws_handler.WebSocketHandler;
 const WebSocketConnection = ws_handler.WebSocketConnection;
+
+// Worker pool for multi-threaded mode
+pub const worker_pool = @import("worker_pool.zig");
+pub const WorkerPool = worker_pool.WorkerPool;
+pub const WorkerPoolConfig = worker_pool.WorkerPoolConfig;
+pub const WorkItem = worker_pool.WorkItem;
 
 /// Server configuration.
 pub const ServerConfig = struct {
@@ -154,6 +173,10 @@ pub const Server = struct {
     listener: ?TcpListener = null,
     running: bool = false,
 
+    // Multi-threading support
+    pool: ?WorkerPool = null,
+    threading_enabled: bool = false,
+
     const Self = @This();
 
     /// Creates a server with default configuration.
@@ -172,10 +195,53 @@ pub const Server = struct {
 
     /// Releases all server resources.
     pub fn deinit(self: *Self) void {
+        if (self.pool) |*p| {
+            p.deinit();
+            self.pool = null;
+        }
         self.router.deinit();
         self.middleware.deinit(self.allocator);
         self.ws_handlers.deinit(self.allocator);
         if (self.listener) |*l| l.deinit();
+    }
+
+    /// Enables multi-threaded request handling.
+    ///
+    /// When enabled, incoming connections are dispatched to a pool of worker
+    /// threads for concurrent processing. This significantly improves throughput
+    /// under load.
+    ///
+    /// Example:
+    /// ```zig
+    /// var server = Server.init(allocator);
+    /// try server.enableThreading(.{ .num_workers = 8 });
+    /// ```
+    pub fn enableThreading(self: *Self, config: WorkerPoolConfig) void {
+        self.pool = WorkerPool.init(self.allocator, config);
+        self.pool.?.setHandler(handleConnectionFromPool, @ptrCast(self));
+        self.threading_enabled = true;
+    }
+
+    /// Disables multi-threaded request handling.
+    pub fn disableThreading(self: *Self) void {
+        if (self.pool) |*p| {
+            p.deinit();
+            self.pool = null;
+        }
+        self.threading_enabled = false;
+    }
+
+    /// Returns true if multi-threading is enabled.
+    pub fn isThreadingEnabled(self: *const Self) bool {
+        return self.threading_enabled;
+    }
+
+    /// Returns the worker pool statistics (if threading is enabled).
+    pub fn getWorkerStats(self: *Self) ?WorkerPool.Stats {
+        if (self.pool) |*p| {
+            return p.getStats();
+        }
+        return null;
     }
 
     /// Adds middleware to the server.
@@ -224,12 +290,28 @@ pub const Server = struct {
     }
 
     /// Starts the server and begins accepting connections.
+    ///
+    /// In single-threaded mode (default), connections are handled sequentially.
+    /// In multi-threaded mode (after calling `enableThreading`), connections
+    /// are dispatched to worker threads for concurrent processing.
     pub fn listen(self: *Self) !void {
         const addr = try net.Address.parseIp(self.config.host, self.config.port);
         self.listener = try TcpListener.init(addr);
         self.running = true;
 
-        std.debug.print("Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
+        // Start worker pool if threading is enabled
+        if (self.pool) |*p| {
+            try p.start();
+        }
+
+        const mode_str = if (self.threading_enabled) "multi-threaded" else "single-threaded";
+        const workers = if (self.pool) |*p| p.workerCount() else @as(u32, 1);
+        std.debug.print("Server listening on {s}:{d} ({s}, {d} workers)\n", .{
+            self.config.host,
+            self.config.port,
+            mode_str,
+            workers,
+        });
 
         while (self.running) {
             const conn = self.listener.?.accept() catch |err| {
@@ -237,19 +319,55 @@ pub const Server = struct {
                 continue;
             };
 
-            self.handleConnection(conn.socket) catch |err| {
-                std.debug.print("Handler error: {}\n", .{err});
-            };
+            if (self.threading_enabled) {
+                // Multi-threaded mode: dispatch to worker pool
+                if (self.pool) |*p| {
+                    p.submit(.{
+                        .socket = conn.socket,
+                        .client_addr = conn.addr,
+                        .accepted_at = std.time.milliTimestamp(),
+                    }) catch |err| {
+                        std.debug.print("Worker pool submit error: {}\n", .{err});
+                        var sock = conn.socket;
+                        sock.close();
+                    };
+                }
+            } else {
+                // Single-threaded mode: handle directly
+                self.handleConnection(conn.socket) catch |err| {
+                    std.debug.print("Handler error: {}\n", .{err});
+                };
+            }
         }
     }
 
-    /// Stops the server.
+    /// Stops the server gracefully.
+    ///
+    /// In multi-threaded mode, this will wait for all worker threads to finish
+    /// processing their current requests before returning.
     pub fn stop(self: *Self) void {
         self.running = false;
+
+        // Stop worker pool first
+        if (self.pool) |*p| {
+            p.stop();
+        }
+
         if (self.listener) |*l| {
             l.deinit();
             self.listener = null;
         }
+    }
+
+    /// Callback for worker pool to handle connections.
+    fn handleConnectionFromPool(item: *WorkItem, ctx: ?*anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx.?));
+        self.handleConnection(item.socket) catch |err| {
+            std.debug.print("Worker handler error: {}\n", .{err});
+            if (self.pool) |*p| {
+                p.recordError();
+            }
+        };
     }
 
     /// Handles a single connection.

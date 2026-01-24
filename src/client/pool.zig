@@ -1,14 +1,21 @@
 //! HTTP Connection Pool for httpx.zig
 //!
-//! Provides connection pooling for HTTP clients:
+//! Provides thread-safe connection pooling for HTTP clients:
 //!
 //! - Reusable TCP connections with keep-alive
 //! - Per-host connection limits
 //! - Automatic connection health checking
 //! - Idle connection timeout and cleanup
+//! - Thread-safe for concurrent access
+//!
+//! ## Thread Safety
+//!
+//! All public methods are thread-safe and can be called concurrently from
+//! multiple threads. The pool uses a mutex to protect its internal state.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Thread = std.Thread;
 const net = std.net;
 
 const Socket = @import("../net/socket.zig").Socket;
@@ -76,12 +83,15 @@ pub const PoolConfig = struct {
     health_check_interval_ms: i64 = 30_000,
 };
 
-/// HTTP connection pool.
+/// Thread-safe HTTP connection pool.
 pub const ConnectionPool = struct {
     allocator: Allocator,
     config: PoolConfig,
     connections: std.ArrayListUnmanaged(Connection) = .empty,
     hosts_owned: std.ArrayListUnmanaged([]u8) = .empty,
+
+    /// Mutex for thread-safe access.
+    mutex: Thread.Mutex = .{},
 
     const Self = @This();
 
@@ -99,6 +109,8 @@ pub const ConnectionPool = struct {
     }
 
     /// Releases all pool resources.
+    /// Note: This method is NOT thread-safe. Call only when no other threads
+    /// are accessing the pool.
     pub fn deinit(self: *Self) void {
         for (self.connections.items) |*conn| {
             conn.close();
@@ -112,7 +124,17 @@ pub const ConnectionPool = struct {
     }
 
     /// Gets or creates a connection to the specified host.
+    /// Thread-safe: can be called from multiple threads concurrently.
     pub fn getConnection(self: *Self, host: []const u8, port: u16) !*Connection {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.getConnectionLocked(host, port);
+    }
+
+    /// Internal: get connection while already holding the lock.
+    fn getConnectionLocked(self: *Self, host: []const u8, port: u16) !*Connection {
+        // Try to find an existing healthy connection
         for (self.connections.items) |*conn| {
             if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
                 if (conn.isHealthy(self.config.idle_timeout_ms) and conn.requests_made < self.config.max_requests_per_connection) {
@@ -122,20 +144,31 @@ pub const ConnectionPool = struct {
             }
         }
 
-        if (self.totalCount() >= self.config.max_connections) return PoolError.PoolExhausted;
+        // Check global limit
+        if (self.totalCountLocked() >= self.config.max_connections) {
+            return PoolError.PoolExhausted;
+        }
 
+        // Check per-host limit
         var host_count: u32 = 0;
         for (self.connections.items) |conn| {
-            if (std.mem.eql(u8, conn.host, host) and conn.port == port) host_count += 1;
+            if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
+                host_count += 1;
+            }
         }
-        if (host_count >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
+        if (host_count >= self.config.max_per_host) {
+            return PoolError.PoolExhaustedForHost;
+        }
 
-        return self.createConnection(host, port);
+        // Create new connection
+        return self.createConnectionLocked(host, port);
     }
 
-    /// Creates a new connection.
-    fn createConnection(self: *Self, host: []const u8, port: u16) !*Connection {
+    /// Internal: create connection while already holding the lock.
+    fn createConnectionLocked(self: *Self, host: []const u8, port: u16) !*Connection {
         const host_owned = try self.allocator.dupe(u8, host);
+        errdefer self.allocator.free(host_owned);
+
         try self.hosts_owned.append(self.allocator, host_owned);
 
         const addr = try address_mod.resolve(host, port);
@@ -159,13 +192,25 @@ pub const ConnectionPool = struct {
     }
 
     /// Releases a connection back to the pool.
+    /// Thread-safe: can be called from multiple threads concurrently.
     pub fn releaseConnection(self: *Self, conn: *Connection) void {
-        _ = self;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         conn.release();
     }
 
     /// Removes idle connections that have exceeded the timeout.
+    /// Thread-safe: can be called from multiple threads concurrently.
     pub fn cleanup(self: *Self) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.cleanupLocked();
+    }
+
+    /// Internal: cleanup while already holding the lock.
+    fn cleanupLocked(self: *Self) void {
         var i: usize = 0;
         while (i < self.connections.items.len) {
             const conn = &self.connections.items[i];
@@ -178,8 +223,12 @@ pub const ConnectionPool = struct {
         }
     }
 
-    /// Returns the number of active connections.
-    pub fn activeCount(self: *const Self) usize {
+    /// Returns the number of active (in-use) connections.
+    /// Thread-safe: can be called from multiple threads concurrently.
+    pub fn activeCount(self: *Self) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var count: usize = 0;
         for (self.connections.items) |conn| {
             if (conn.in_use) count += 1;
@@ -187,15 +236,61 @@ pub const ConnectionPool = struct {
         return count;
     }
 
-    /// Returns the total number of connections.
-    pub fn totalCount(self: *const Self) usize {
+    /// Returns the total number of connections in the pool.
+    /// Thread-safe: can be called from multiple threads concurrently.
+    pub fn totalCount(self: *Self) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.totalCountLocked();
+    }
+
+    /// Internal: total count while already holding the lock.
+    fn totalCountLocked(self: *const Self) usize {
         return self.connections.items.len;
     }
 
-    /// Returns the number of idle connections.
-    pub fn idleCount(self: *const Self) usize {
-        return self.totalCount() - self.activeCount();
+    /// Returns the number of idle (not in-use) connections.
+    /// Thread-safe: can be called from multiple threads concurrently.
+    pub fn idleCount(self: *Self) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var active: usize = 0;
+        for (self.connections.items) |conn| {
+            if (conn.in_use) active += 1;
+        }
+        return self.connections.items.len - active;
     }
+
+    /// Returns a snapshot of pool statistics.
+    /// Thread-safe: can be called from multiple threads concurrently.
+    pub fn getStats(self: *Self) PoolStats {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var active: usize = 0;
+        for (self.connections.items) |conn| {
+            if (conn.in_use) active += 1;
+        }
+
+        return .{
+            .total_connections = self.connections.items.len,
+            .active_connections = active,
+            .idle_connections = self.connections.items.len - active,
+            .max_connections = self.config.max_connections,
+            .max_per_host = self.config.max_per_host,
+        };
+    }
+};
+
+/// Pool statistics snapshot.
+pub const PoolStats = struct {
+    total_connections: usize,
+    active_connections: usize,
+    idle_connections: usize,
+    max_connections: u32,
+    max_per_host: u32,
 };
 
 test "ConnectionPool initialization" {
