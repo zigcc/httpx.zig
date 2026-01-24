@@ -456,7 +456,7 @@ pub const Timeouts = struct {
     idle_ms: u64 = 120_000,
     request_ms: u64 = 0,
 
-    /// Creates a timeout configuration with all values set uniformly.
+    /// Creates a timeout configuration with base value and scaled keep-alive/idle times.
     pub fn uniform(ms: u64) Timeouts {
         return .{
             .connect_ms = ms,
@@ -464,6 +464,7 @@ pub const Timeouts = struct {
             .write_ms = ms,
             .keep_alive_ms = ms * 2,
             .idle_ms = ms * 4,
+            .request_ms = ms,
         };
     }
 
@@ -485,6 +486,7 @@ pub const Timeouts = struct {
             .write_ms = 0,
             .keep_alive_ms = 0,
             .idle_ms = 0,
+            .request_ms = 0,
         };
     }
 };
