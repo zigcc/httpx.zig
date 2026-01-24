@@ -4,7 +4,6 @@
 //!
 //! - Thread pool for parallel execution
 //! - Task queuing and scheduling
-//! - Work stealing for load balancing
 //! - Cross-platform thread management
 
 const std = @import("std");

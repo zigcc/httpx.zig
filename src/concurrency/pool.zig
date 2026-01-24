@@ -210,171 +210,201 @@ pub fn allSettled(allocator: Allocator, client: *Client, specs: []const RequestS
 }
 
 /// Executes all requests and returns the first successful response.
+/// Uses limited concurrency (default: 16 threads) to avoid thread explosion.
 pub fn any(allocator: Allocator, client: *Client, specs: []const RequestSpec) !?Response {
+    return anyWithConcurrency(allocator, client, specs, DEFAULT_MAX_CONCURRENCY);
+}
+
+/// Executes all requests with limited concurrency, returns first successful response.
+pub fn anyWithConcurrency(
+    allocator: Allocator,
+    client: *Client,
+    specs: []const RequestSpec,
+    max_concurrency: usize,
+) !?Response {
     _ = allocator;
 
     if (specs.len == 0) return null;
 
-    // NOTE: This function assumes `client` (and its allocator) are safe to use
-    // concurrently. If you pass a non-thread-safe allocator, behavior is undefined.
-    const WorkerCtx = struct {
+    const concurrency = if (max_concurrency == 0) DEFAULT_MAX_CONCURRENCY else max_concurrency;
+    const num_threads = @min(concurrency, specs.len);
+
+    const SharedState = struct {
         client: *Client,
-        spec: RequestSpec,
-        winner: *std.atomic.Value(bool),
-        result: *?Response,
-        mutex: *Thread.Mutex,
-        cond: *Thread.Condition,
-        remaining: *std.atomic.Value(usize),
+        specs: []const RequestSpec,
+        next_index: std.atomic.Value(usize),
+        winner: std.atomic.Value(bool),
+        result: ?Response,
+        mutex: Thread.Mutex,
+        cond: Thread.Condition,
+        active_workers: std.atomic.Value(usize),
 
-        fn run(self: *@This()) void {
-            var rr = executeSpec(self.client, self.spec);
-            defer rr.deinit();
-
-            if (rr == .success and rr.success.status.isSuccess()) {
-                if (!self.winner.swap(true, .acq_rel)) {
+        fn workerFn(self: *@This()) void {
+            defer {
+                const prev = self.active_workers.fetchSub(1, .acq_rel);
+                if (prev == 1) {
                     self.mutex.lock();
-                    self.result.* = rr.success;
-                    // transfer ownership to caller
-                    rr = .{ .err = error.UnusedResult };
                     self.cond.signal();
                     self.mutex.unlock();
                 }
             }
 
-            const prev = self.remaining.fetchSub(1, .acq_rel);
-            if (prev == 1) {
-                self.mutex.lock();
-                self.cond.signal();
-                self.mutex.unlock();
+            while (!self.winner.load(.acquire)) {
+                const idx = self.next_index.fetchAdd(1, .acq_rel);
+                if (idx >= self.specs.len) break;
+
+                var rr = executeSpec(self.client, self.specs[idx]);
+
+                if (rr == .success and rr.success.status.isSuccess()) {
+                    if (!self.winner.swap(true, .acq_rel)) {
+                        self.mutex.lock();
+                        self.result = rr.success;
+                        rr = .{ .err = error.UnusedResult };
+                        self.cond.signal();
+                        self.mutex.unlock();
+                    }
+                }
+                rr.deinit();
             }
         }
     };
 
-    var winner = std.atomic.Value(bool).init(false);
-    var remaining = std.atomic.Value(usize).init(specs.len);
-    var mutex = Thread.Mutex{};
-    var cond = Thread.Condition{};
-    var result: ?Response = null;
+    var state = SharedState{
+        .client = client,
+        .specs = specs,
+        .next_index = std.atomic.Value(usize).init(0),
+        .winner = std.atomic.Value(bool).init(false),
+        .result = null,
+        .mutex = .{},
+        .cond = .{},
+        .active_workers = std.atomic.Value(usize).init(num_threads),
+    };
 
-    var threads = try std.heap.page_allocator.alloc(Thread, specs.len);
+    var threads = try std.heap.page_allocator.alloc(Thread, num_threads);
     defer std.heap.page_allocator.free(threads);
-
-    var ctxs = try std.heap.page_allocator.alloc(WorkerCtx, specs.len);
-    defer std.heap.page_allocator.free(ctxs);
 
     var spawned: usize = 0;
     errdefer {
-        var i: usize = 0;
-        while (i < spawned) : (i += 1) threads[i].join();
-        if (result) |*r| r.deinit();
+        state.winner.store(true, .release); // Signal workers to stop
+        for (threads[0..spawned]) |t| t.join();
+        if (state.result) |*r| r.deinit();
     }
 
-    for (specs, 0..) |spec, i| {
-        ctxs[i] = .{
-            .client = client,
-            .spec = spec,
-            .winner = &winner,
-            .result = &result,
-            .mutex = &mutex,
-            .cond = &cond,
-            .remaining = &remaining,
-        };
-        threads[i] = try Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[i]});
+    for (threads) |*t| {
+        t.* = try Thread.spawn(.{}, SharedState.workerFn, .{&state});
         spawned += 1;
     }
 
     // Wait until a success is found or all workers complete.
-    mutex.lock();
-    while (!winner.load(.acquire) and remaining.load(.acquire) != 0) {
-        cond.wait(&mutex);
+    state.mutex.lock();
+    while (!state.winner.load(.acquire) and state.active_workers.load(.acquire) != 0) {
+        state.cond.wait(&state.mutex);
     }
-    mutex.unlock();
+    state.mutex.unlock();
 
+    // Signal remaining workers to stop and join
+    state.winner.store(true, .release);
     for (threads[0..spawned]) |t| t.join();
 
-    return result;
+    return state.result;
 }
 
-/// Executes all requests and returns the first to complete.
+/// Executes all requests and returns the first to complete (success or failure).
+/// Uses limited concurrency (default: 16 threads) to avoid thread explosion.
 pub fn race(allocator: Allocator, client: *Client, specs: []const RequestSpec) !RequestResult {
+    return raceWithConcurrency(allocator, client, specs, DEFAULT_MAX_CONCURRENCY);
+}
+
+/// Executes all requests with limited concurrency, returns first to complete.
+pub fn raceWithConcurrency(
+    allocator: Allocator,
+    client: *Client,
+    specs: []const RequestSpec,
+    max_concurrency: usize,
+) !RequestResult {
     _ = allocator;
 
     if (specs.len == 0) return .{ .err = error.NoRequests };
 
-    const WorkerCtx = struct {
+    const concurrency = if (max_concurrency == 0) DEFAULT_MAX_CONCURRENCY else max_concurrency;
+    const num_threads = @min(concurrency, specs.len);
+
+    const SharedState = struct {
         client: *Client,
-        spec: RequestSpec,
-        winner: *std.atomic.Value(bool),
-        result: *RequestResult,
-        mutex: *Thread.Mutex,
-        cond: *Thread.Condition,
-        remaining: *std.atomic.Value(usize),
+        specs: []const RequestSpec,
+        next_index: std.atomic.Value(usize),
+        winner: std.atomic.Value(bool),
+        result: RequestResult,
+        mutex: Thread.Mutex,
+        cond: Thread.Condition,
+        active_workers: std.atomic.Value(usize),
 
-        fn run(self: *@This()) void {
-            var rr = executeSpec(self.client, self.spec);
-
-            if (!self.winner.swap(true, .acq_rel)) {
-                self.mutex.lock();
-                self.result.* = rr;
-                self.cond.signal();
-                self.mutex.unlock();
-                // ownership transferred to caller
-                rr = .{ .err = error.UnusedResult };
+        fn workerFn(self: *@This()) void {
+            defer {
+                const prev = self.active_workers.fetchSub(1, .acq_rel);
+                if (prev == 1) {
+                    self.mutex.lock();
+                    self.cond.signal();
+                    self.mutex.unlock();
+                }
             }
 
-            rr.deinit();
+            while (!self.winner.load(.acquire)) {
+                const idx = self.next_index.fetchAdd(1, .acq_rel);
+                if (idx >= self.specs.len) break;
 
-            const prev = self.remaining.fetchSub(1, .acq_rel);
-            if (prev == 1) {
-                self.mutex.lock();
-                self.cond.signal();
-                self.mutex.unlock();
+                var rr = executeSpec(self.client, self.specs[idx]);
+
+                if (!self.winner.swap(true, .acq_rel)) {
+                    self.mutex.lock();
+                    self.result = rr;
+                    rr = .{ .err = error.UnusedResult };
+                    self.cond.signal();
+                    self.mutex.unlock();
+                }
+                rr.deinit();
             }
         }
     };
 
-    var winner = std.atomic.Value(bool).init(false);
-    var remaining = std.atomic.Value(usize).init(specs.len);
-    var mutex = Thread.Mutex{};
-    var cond = Thread.Condition{};
-    var result: RequestResult = .{ .err = error.NoRequests };
+    var state = SharedState{
+        .client = client,
+        .specs = specs,
+        .next_index = std.atomic.Value(usize).init(0),
+        .winner = std.atomic.Value(bool).init(false),
+        .result = .{ .err = error.NoRequests },
+        .mutex = .{},
+        .cond = .{},
+        .active_workers = std.atomic.Value(usize).init(num_threads),
+    };
 
-    var threads = try std.heap.page_allocator.alloc(Thread, specs.len);
+    var threads = try std.heap.page_allocator.alloc(Thread, num_threads);
     defer std.heap.page_allocator.free(threads);
-
-    var ctxs = try std.heap.page_allocator.alloc(WorkerCtx, specs.len);
-    defer std.heap.page_allocator.free(ctxs);
 
     var spawned: usize = 0;
     errdefer {
-        var i: usize = 0;
-        while (i < spawned) : (i += 1) threads[i].join();
-        result.deinit();
+        state.winner.store(true, .release);
+        for (threads[0..spawned]) |t| t.join();
+        state.result.deinit();
     }
 
-    for (specs, 0..) |spec, i| {
-        ctxs[i] = .{
-            .client = client,
-            .spec = spec,
-            .winner = &winner,
-            .result = &result,
-            .mutex = &mutex,
-            .cond = &cond,
-            .remaining = &remaining,
-        };
-        threads[i] = try Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[i]});
+    for (threads) |*t| {
+        t.* = try Thread.spawn(.{}, SharedState.workerFn, .{&state});
         spawned += 1;
     }
 
-    mutex.lock();
-    while (!winner.load(.acquire) and remaining.load(.acquire) != 0) {
-        cond.wait(&mutex);
+    // Wait until first result or all workers complete.
+    state.mutex.lock();
+    while (!state.winner.load(.acquire) and state.active_workers.load(.acquire) != 0) {
+        state.cond.wait(&state.mutex);
     }
-    mutex.unlock();
+    state.mutex.unlock();
 
+    // Signal remaining workers to stop and join
+    state.winner.store(true, .release);
     for (threads[0..spawned]) |t| t.join();
 
-    return result;
+    return state.result;
 }
 
 fn executeSpec(client: *Client, spec: RequestSpec) RequestResult {

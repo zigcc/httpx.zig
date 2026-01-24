@@ -76,10 +76,15 @@ pub const Connection = struct {
 
 /// Connection pool configuration.
 pub const PoolConfig = struct {
-    max_connections: u32 = 20,
-    max_per_host: u32 = 5,
+    /// Maximum total connections across all hosts.
+    max_connections: u32 = 100,
+    /// Maximum connections per host.
+    max_per_host: u32 = 10,
+    /// Close idle connections after this duration.
     idle_timeout_ms: i64 = 60_000,
+    /// Recycle connection after this many requests.
     max_requests_per_connection: u32 = 1000,
+    /// Health check interval (reserved for future use).
     health_check_interval_ms: i64 = 30_000,
 };
 
