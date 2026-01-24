@@ -110,7 +110,7 @@ const LinuxEpoll = struct {
             .events = toEpollEvents(events),
             .data = .{ .ptr = data },
         };
-        try posix.epoll_ctl(self.epoll_fd, .ADD, fd, &ev);
+        try posix.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_ADD, fd, &ev);
     }
 
     pub fn modify(self: *Self, fd: posix.fd_t, events: EventMask, data: usize) !void {
@@ -118,18 +118,18 @@ const LinuxEpoll = struct {
             .events = toEpollEvents(events),
             .data = .{ .ptr = data },
         };
-        try posix.epoll_ctl(self.epoll_fd, .MOD, fd, &ev);
+        try posix.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_MOD, fd, &ev);
     }
 
     pub fn remove(self: *Self, fd: posix.fd_t) !void {
-        try posix.epoll_ctl(self.epoll_fd, .DEL, fd, null);
+        try posix.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_DEL, fd, null);
     }
 
     pub fn wait(self: *Self, events: []Event, timeout_ms: ?i32) !usize {
         var raw_events: [256]std.os.linux.epoll_event = undefined;
         const max_events = @min(events.len, raw_events.len);
 
-        const n = try posix.epoll_wait(
+        const n = posix.epoll_wait(
             self.epoll_fd,
             raw_events[0..max_events],
             timeout_ms orelse -1,
@@ -365,4 +365,50 @@ test "EventMask constants" {
     const read_write = EventMask.read_write;
     try std.testing.expect(read_write.readable);
     try std.testing.expect(read_write.writable);
+}
+
+test "Poller add and remove" {
+    const net = std.net;
+    var poller = try Poller.init(std.testing.allocator);
+    defer poller.deinit();
+
+    // Create a socket to register
+    const addr = try net.Address.parseIp("127.0.0.1", 0);
+    const sock = try posix.socket(addr.any.family, posix.SOCK.STREAM, 0);
+    defer posix.close(sock);
+
+    // Add socket to poller
+    try poller.add(sock, .{ .readable = true }, 42);
+
+    // Modify events
+    try poller.modify(sock, .{ .readable = true, .writable = true }, 42);
+
+    // Remove socket
+    try poller.remove(sock);
+}
+
+test "Poller poll returns immediately with no events" {
+    var poller = try Poller.init(std.testing.allocator);
+    defer poller.deinit();
+
+    var events: [16]Event = undefined;
+
+    // Poll with 0 timeout should return immediately
+    const n = try poller.poll(&events);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "Poller wait with timeout" {
+    var poller = try Poller.init(std.testing.allocator);
+    defer poller.deinit();
+
+    var events: [16]Event = undefined;
+
+    // Wait with short timeout should return after timeout
+    const start = std.time.milliTimestamp();
+    const n = try poller.wait(&events, 10); // 10ms timeout
+    const elapsed = std.time.milliTimestamp() - start;
+
+    try std.testing.expectEqual(@as(usize, 0), n);
+    try std.testing.expect(elapsed >= 5); // Allow some tolerance
 }

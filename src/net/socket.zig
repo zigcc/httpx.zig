@@ -330,12 +330,12 @@ pub const Socket = struct {
             }
         } else {
             // POSIX: use fcntl with O_NONBLOCK
-            const current_flags = try posix.fcntl(self.handle, .F_GETFL, 0);
+            const current_flags = try posix.fcntl(self.handle, posix.F.GETFL, 0);
             const new_flags = if (enable)
                 current_flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))
             else
                 current_flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
-            _ = try posix.fcntl(self.handle, .F_SETFL, new_flags);
+            _ = try posix.fcntl(self.handle, posix.F.SETFL, new_flags);
         }
     }
 
@@ -346,7 +346,7 @@ pub const Socket = struct {
             // Return false as a safe default
             return false;
         } else {
-            const flags = try posix.fcntl(self.handle, .F_GETFL, 0);
+            const flags = try posix.fcntl(self.handle, posix.F.GETFL, 0);
             return (flags & @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))) != 0;
         }
     }
@@ -597,12 +597,12 @@ pub const UdpSocket = struct {
                 return error.SetNonBlockingFailed;
             }
         } else {
-            const current_flags = try posix.fcntl(self.handle, .F_GETFL, 0);
+            const current_flags = try posix.fcntl(self.handle, posix.F.GETFL, 0);
             const new_flags = if (enable)
                 current_flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))
             else
                 current_flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
-            _ = try posix.fcntl(self.handle, .F_SETFL, new_flags);
+            _ = try posix.fcntl(self.handle, posix.F.SETFL, new_flags);
         }
     }
 
@@ -656,4 +656,38 @@ test "UdpSocket send/recv localhost" {
     var buf: [32]u8 = undefined;
     const got = try recv_sock.recvFrom(&buf);
     try std.testing.expectEqualStrings(msg, buf[0..got.n]);
+}
+
+test "Socket setNonBlocking" {
+    var socket = try Socket.create();
+    defer socket.close();
+
+    // Set non-blocking mode
+    try socket.setNonBlocking(true);
+
+    // On POSIX, we can verify it was set
+    if (!is_windows) {
+        const is_nb = try socket.isNonBlocking();
+        try std.testing.expect(is_nb);
+    }
+
+    // Set back to blocking mode
+    try socket.setNonBlocking(false);
+
+    if (!is_windows) {
+        const is_nb = try socket.isNonBlocking();
+        try std.testing.expect(!is_nb);
+    }
+}
+
+test "TcpListener with non-blocking accept" {
+    var listener = try TcpListener.init(try net.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    // Set listener to non-blocking
+    try listener.socket.setNonBlocking(true);
+
+    // Accept should return WouldBlock since no connections pending
+    const result = listener.socket.accept();
+    try std.testing.expectError(error.WouldBlock, result);
 }

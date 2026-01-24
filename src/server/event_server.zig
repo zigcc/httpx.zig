@@ -564,3 +564,57 @@ test "Connection reset" {
     try std.testing.expectEqual(@as(usize, 0), conn.write_pos);
     try std.testing.expectEqual(ConnectionState.reading_request, conn.state);
 }
+
+test "Connection activity tracking" {
+    const allocator = std.testing.allocator;
+    const socket = try Socket.create();
+
+    const conn = try Connection.init(allocator, socket, .{});
+    defer conn.deinit(allocator);
+
+    const initial_activity = conn.last_activity;
+
+    // Wait a bit and update activity
+    std.Thread.sleep(1_000_000); // 1ms
+    conn.updateActivity();
+
+    try std.testing.expect(conn.last_activity > initial_activity);
+}
+
+test "Connection idle detection" {
+    const allocator = std.testing.allocator;
+    const socket = try Socket.create();
+
+    const conn = try Connection.init(allocator, socket, .{});
+    defer conn.deinit(allocator);
+
+    // Connection should not be idle immediately
+    try std.testing.expect(!conn.isIdle(1000)); // 1 second timeout
+
+    // Simulate old activity
+    conn.last_activity = std.time.milliTimestamp() - 2000; // 2 seconds ago
+
+    // Now it should be idle with 1 second timeout
+    try std.testing.expect(conn.isIdle(1000));
+}
+
+test "EventServer stats" {
+    const allocator = std.testing.allocator;
+    var server = try EventServer.init(allocator, .{});
+    defer server.deinit();
+
+    const stats = server.getStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.connections_accepted.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), stats.requests_handled.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), stats.getActiveConnections());
+}
+
+test "EventServerConfig defaults" {
+    const config = EventServerConfig{};
+
+    try std.testing.expectEqualStrings("0.0.0.0", config.host);
+    try std.testing.expectEqual(@as(u16, 8080), config.port);
+    try std.testing.expectEqual(@as(usize, 10000), config.max_connections);
+    try std.testing.expect(config.tcp_keepalive);
+    try std.testing.expect(config.tcp_nodelay);
+}

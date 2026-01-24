@@ -414,3 +414,88 @@ test "TlsSessionPool hit rate" {
     try std.testing.expectEqual(@as(u64, 2), stats.getMisses());
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), stats.getHitRate(), 0.01);
 }
+
+test "TlsSessionTicket expiration check" {
+    const now = std.time.milliTimestamp();
+
+    // Not expired ticket
+    const valid_ticket = TlsSessionTicket{
+        .ticket = &[_]u8{},
+        .created_at = now,
+        .expires_at = now + 3600_000, // 1 hour from now
+        .tls_version = 0x0304,
+        .cipher_suite = 0,
+    };
+    try std.testing.expect(!valid_ticket.isExpired());
+    try std.testing.expect(valid_ticket.timeToLive() > 0);
+
+    // Expired ticket
+    const expired_ticket = TlsSessionTicket{
+        .ticket = &[_]u8{},
+        .created_at = now - 7200_000, // 2 hours ago
+        .expires_at = now - 3600_000, // 1 hour ago
+        .tls_version = 0x0304,
+        .cipher_suite = 0,
+    };
+    try std.testing.expect(expired_ticket.isExpired());
+    try std.testing.expectEqual(@as(i64, 0), expired_ticket.timeToLive());
+}
+
+test "TlsSessionPool expired session returns null" {
+    const allocator = std.testing.allocator;
+    var pool = TlsSessionPool.initWithConfig(allocator, .{
+        .default_lifetime_ms = 1, // 1ms lifetime - will expire immediately
+        .auto_cleanup = false,
+    });
+    defer pool.deinit();
+
+    try pool.saveSession("example.com", "ticket", .{ .lifetime_ms = 1 });
+
+    // Wait for expiration
+    std.Thread.sleep(2_000_000); // 2ms
+
+    // Should return null because expired
+    const result = pool.getSession("example.com");
+    try std.testing.expect(result == null);
+}
+
+test "TlsSessionPool eviction when full" {
+    const allocator = std.testing.allocator;
+    var pool = TlsSessionPool.initWithConfig(allocator, .{
+        .max_sessions = 2,
+        .auto_cleanup = false,
+    });
+    defer pool.deinit();
+
+    // Fill the pool
+    try pool.saveSession("a.com", "ticket-a", .{});
+    try pool.saveSession("b.com", "ticket-b", .{});
+    try std.testing.expectEqual(@as(usize, 2), pool.count());
+
+    // Add one more - should evict oldest
+    try pool.saveSession("c.com", "ticket-c", .{});
+    try std.testing.expectEqual(@as(usize, 2), pool.count());
+
+    // c.com should exist
+    try std.testing.expect(pool.hasSession("c.com"));
+}
+
+test "TlsSessionPool manual cleanup" {
+    const allocator = std.testing.allocator;
+    var pool = TlsSessionPool.initWithConfig(allocator, .{
+        .cleanup_interval_ms = 0, // Always run cleanup
+        .auto_cleanup = false,
+    });
+    defer pool.deinit();
+
+    // Add a session with very short lifetime
+    try pool.saveSession("example.com", "ticket", .{ .lifetime_ms = 1 });
+
+    // Wait for expiration
+    std.Thread.sleep(2_000_000); // 2ms
+
+    // Manual cleanup should remove expired
+    const cleaned = pool.cleanup();
+    try std.testing.expect(cleaned >= 1);
+    try std.testing.expectEqual(@as(usize, 0), pool.count());
+}
