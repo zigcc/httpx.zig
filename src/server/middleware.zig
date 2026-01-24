@@ -16,6 +16,9 @@ const Response = @import("../core/response.zig").Response;
 const types = @import("../core/types.zig");
 const compression_util = @import("../util/compression.zig");
 const HeaderName = @import("../core/headers.zig").HeaderName;
+const etag_util = @import("../util/etag.zig");
+const range_util = @import("../util/range.zig");
+const date_util = @import("../util/date.zig");
 
 /// Middleware function type.
 pub const Middleware = struct {
@@ -431,6 +434,248 @@ pub fn requestId() Middleware {
     };
 }
 
+// =============================================================================
+// Conditional Request Middleware (ETag / If-None-Match / If-Modified-Since)
+// =============================================================================
+
+/// Configuration for conditional request middleware.
+pub const ConditionalConfig = struct {
+    /// Whether to generate ETags automatically from response body.
+    auto_etag: bool = true,
+
+    /// Whether to add Last-Modified header automatically.
+    auto_last_modified: bool = false,
+
+    /// Resource modification timestamp (Unix seconds).
+    /// If null, current time is used for Last-Modified.
+    last_modified: ?i64 = null,
+};
+
+/// Creates conditional request middleware with default configuration.
+/// Handles If-None-Match (ETag) and If-Modified-Since headers.
+/// Returns 304 Not Modified when appropriate.
+pub fn conditional() Middleware {
+    return conditionalWithConfig(.{});
+}
+
+/// Creates conditional request middleware with custom configuration.
+pub fn conditionalWithConfig(config: ConditionalConfig) Middleware {
+    _ = config; // Stateless limitation - will use defaults
+    return .{
+        .name = "conditional",
+        .handler = struct {
+            fn handler(ctx: *Context, next: Next) anyerror!Response {
+                // Get response from next handler first
+                var response = try next(ctx);
+
+                // Only handle GET and HEAD requests for conditional responses
+                if (ctx.request.method != .GET and ctx.request.method != .HEAD) {
+                    return response;
+                }
+
+                // Generate ETag if response has a body and no ETag set
+                var etag_buf: [72]u8 = undefined;
+                var etag_value: ?[]const u8 = response.headers.get(HeaderName.ETAG);
+
+                if (etag_value == null) {
+                    if (response.body) |body| {
+                        // Generate ETag from body content
+                        const hash = etag_util.generate(body);
+                        const server_etag = etag_util.ETag{ .value = &hash, .weak = false };
+                        etag_value = server_etag.format(&etag_buf);
+                        response.headers.set(HeaderName.ETAG, etag_value.?) catch {};
+                    }
+                }
+
+                // Check If-None-Match header (ETag comparison)
+                if (ctx.header("If-None-Match")) |if_none_match| {
+                    if (etag_value) |etag_str| {
+                        // Parse server's ETag
+                        if (etag_util.parse(etag_str)) |server_etag| {
+                            // Check if client's ETag matches
+                            if (etag_util.matchIfNoneMatch(if_none_match, server_etag)) {
+                                // Return 304 Not Modified
+                                response.deinit();
+                                var not_modified = Response.init(ctx.allocator, 304);
+                                // Preserve ETag in 304 response
+                                not_modified.headers.set(HeaderName.ETAG, etag_str) catch {};
+                                return not_modified;
+                            }
+                        }
+                    }
+                }
+
+                // Check If-Modified-Since header (timestamp comparison)
+                if (ctx.header("If-Modified-Since")) |if_modified_since| {
+                    if (date_util.parseHttpDate(if_modified_since)) |client_time| {
+                        // Get Last-Modified from response or use current time
+                        const last_modified = blk: {
+                            if (response.headers.get("Last-Modified")) |lm| {
+                                break :blk date_util.parseHttpDate(lm) orelse std.time.timestamp();
+                            }
+                            break :blk std.time.timestamp();
+                        };
+
+                        // If resource hasn't been modified since client's time
+                        if (!date_util.isModifiedSince(last_modified, client_time)) {
+                            response.deinit();
+                            var not_modified = Response.init(ctx.allocator, 304);
+                            // Preserve relevant headers
+                            if (etag_value) |etag_str| {
+                                not_modified.headers.set(HeaderName.ETAG, etag_str) catch {};
+                            }
+                            return not_modified;
+                        }
+                    }
+                }
+
+                return response;
+            }
+        }.handler,
+    };
+}
+
+// =============================================================================
+// Range Request Middleware (206 Partial Content)
+// =============================================================================
+
+/// Configuration for range request middleware.
+pub const RangeConfig = struct {
+    /// Whether to accept range requests.
+    accept_ranges: bool = true,
+
+    /// Maximum number of ranges to accept in a single request.
+    /// Requests with more ranges will be served without ranges.
+    max_ranges: usize = 8,
+};
+
+/// Creates range request middleware with default configuration.
+/// Handles Range header and returns 206 Partial Content when appropriate.
+pub fn rangeRequest() Middleware {
+    return rangeRequestWithConfig(.{});
+}
+
+/// Creates range request middleware with custom configuration.
+pub fn rangeRequestWithConfig(config: RangeConfig) Middleware {
+    _ = config; // Stateless limitation
+    return .{
+        .name = "range_request",
+        .handler = struct {
+            fn handler(ctx: *Context, next: Next) anyerror!Response {
+                // Get response from next handler first
+                var response = try next(ctx);
+
+                // Only handle GET requests
+                if (ctx.request.method != .GET) {
+                    return response;
+                }
+
+                // Only handle successful responses
+                if (response.status.code != 200) {
+                    return response;
+                }
+
+                // Need a body to serve ranges
+                const body = response.body orelse return response;
+                const total_size = body.len;
+
+                // Add Accept-Ranges header
+                response.headers.set("Accept-Ranges", "bytes") catch {};
+
+                // Check for Range header
+                const range_header = ctx.header(HeaderName.RANGE) orelse return response;
+
+                // Check If-Range header (conditional range request)
+                if (ctx.header("If-Range")) |if_range| {
+                    // If-Range can be an ETag or a date
+                    var should_serve_full = false;
+
+                    // Try as ETag first
+                    if (etag_util.parse(if_range)) |client_etag| {
+                        if (response.headers.get(HeaderName.ETAG)) |server_etag_str| {
+                            if (etag_util.parse(server_etag_str)) |server_etag| {
+                                // Strong comparison for If-Range
+                                if (!etag_util.match(client_etag, server_etag, .strong)) {
+                                    should_serve_full = true;
+                                }
+                            }
+                        } else {
+                            should_serve_full = true;
+                        }
+                    } else if (date_util.parseHttpDate(if_range)) |client_time| {
+                        // Try as date
+                        const last_modified = blk: {
+                            if (response.headers.get("Last-Modified")) |lm| {
+                                break :blk date_util.parseHttpDate(lm) orelse std.time.timestamp();
+                            }
+                            break :blk std.time.timestamp();
+                        };
+
+                        if (date_util.isModifiedSince(last_modified, client_time)) {
+                            should_serve_full = true;
+                        }
+                    }
+
+                    if (should_serve_full) {
+                        // Resource has been modified, serve full response
+                        return response;
+                    }
+                }
+
+                // Parse Range header
+                const parse_result = range_util.parse(range_header, total_size) catch {
+                    // Invalid or unsatisfiable range
+                    response.deinit();
+                    var range_error = Response.init(ctx.allocator, 416);
+                    var content_range_buf: [64]u8 = undefined;
+                    const content_range = range_util.formatUnsatisfiableRange(total_size, &content_range_buf);
+                    range_error.headers.set("Content-Range", content_range) catch {};
+                    return range_error;
+                };
+
+                // Only support single range for now (multipart is complex)
+                if (parse_result.count != 1) {
+                    // Multiple ranges - serve full content
+                    return response;
+                }
+
+                const byte_range = parse_result.ranges[0].?;
+
+                // Extract the partial content
+                const partial_body = body[byte_range.start .. byte_range.end + 1];
+
+                // Create new partial response
+                response.deinit();
+                var partial = Response.init(ctx.allocator, 206);
+
+                // Copy relevant headers
+                partial.body = ctx.allocator.dupe(u8, partial_body) catch return error.OutOfMemory;
+                partial.body_owned = true;
+
+                // Set Content-Range header
+                var content_range_buf: [64]u8 = undefined;
+                const content_range = range_util.formatContentRange(
+                    byte_range.start,
+                    byte_range.end,
+                    total_size,
+                    &content_range_buf,
+                );
+                partial.headers.set("Content-Range", content_range) catch {};
+
+                // Set Content-Length
+                var len_buf: [32]u8 = undefined;
+                const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{partial_body.len}) catch unreachable;
+                partial.headers.set(HeaderName.CONTENT_LENGTH, len_str) catch {};
+
+                // Set Accept-Ranges
+                partial.headers.set("Accept-Ranges", "bytes") catch {};
+
+                return partial;
+            }
+        }.handler,
+    };
+}
+
 test "Middleware creation" {
     const mw = logger();
     try std.testing.expectEqualStrings("logger", mw.name);
@@ -547,4 +792,20 @@ test "compression middleware creation" {
 
     const mw2 = compressionWithConfig(.{ .min_size = 512 });
     try std.testing.expectEqualStrings("compression", mw2.name);
+}
+
+test "conditional middleware creation" {
+    const mw = conditional();
+    try std.testing.expectEqualStrings("conditional", mw.name);
+
+    const mw2 = conditionalWithConfig(.{ .auto_etag = false });
+    try std.testing.expectEqualStrings("conditional", mw2.name);
+}
+
+test "range request middleware creation" {
+    const mw = rangeRequest();
+    try std.testing.expectEqualStrings("range_request", mw.name);
+
+    const mw2 = rangeRequestWithConfig(.{ .max_ranges = 4 });
+    try std.testing.expectEqualStrings("range_request", mw2.name);
 }
