@@ -157,28 +157,56 @@ pub const Executor = struct {
 };
 
 /// Future representing a pending result.
+/// Uses condition variable for efficient waiting instead of busy-polling.
 pub fn Future(comptime T: type) type {
     return struct {
         result: ?T = null,
         error_val: ?anyerror = null,
-        completed: bool = false,
+        completed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        mutex: Thread.Mutex = .{},
+        cond: Thread.Condition = .{},
 
         const Self = @This();
 
-        /// Waits for the future to complete.
+        /// Waits for the future to complete (blocking).
+        /// Uses condition variable - no busy waiting.
         pub fn wait(self: *Self) !T {
-            while (!self.completed) {
-                std.time.sleep(1_000_000);
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            while (!self.completed.load(.acquire)) {
+                self.cond.wait(&self.mutex);
             }
+
             if (self.error_val) |err| {
                 return err;
             }
             return self.result.?;
         }
 
-        /// Returns the result if available.
-        pub fn get(self: *const Self) ?T {
-            if (self.completed and self.error_val == null) {
+        /// Waits for the future with a timeout.
+        /// Returns null if timeout expires before completion.
+        pub fn waitTimeout(self: *Self, timeout_ns: u64) !?T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (!self.completed.load(.acquire)) {
+                self.cond.timedWait(&self.mutex, timeout_ns) catch {};
+            }
+
+            if (!self.completed.load(.acquire)) {
+                return null; // Timeout
+            }
+
+            if (self.error_val) |err| {
+                return err;
+            }
+            return self.result.?;
+        }
+
+        /// Returns the result if available (non-blocking).
+        pub fn get(self: *Self) ?T {
+            if (self.completed.load(.acquire) and self.error_val == null) {
                 return self.result;
             }
             return null;
@@ -186,7 +214,29 @@ pub fn Future(comptime T: type) type {
 
         /// Returns true if the future is completed.
         pub fn isDone(self: *const Self) bool {
-            return self.completed;
+            return self.completed.load(.acquire);
+        }
+
+        /// Completes the future with a result.
+        /// Wakes up any waiting threads.
+        pub fn complete(self: *Self, value: T) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            self.result = value;
+            self.completed.store(true, .release);
+            self.cond.broadcast();
+        }
+
+        /// Completes the future with an error.
+        /// Wakes up any waiting threads.
+        pub fn completeWithError(self: *Self, err: anyerror) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            self.error_val = err;
+            self.completed.store(true, .release);
+            self.cond.broadcast();
         }
     };
 }
@@ -224,9 +274,40 @@ test "Future" {
     try std.testing.expect(!future.isDone());
     try std.testing.expect(future.get() == null);
 
-    future.result = 42;
-    future.completed = true;
+    // Use new complete() method instead of direct field assignment
+    future.complete(42);
 
     try std.testing.expect(future.isDone());
     try std.testing.expectEqual(@as(i32, 42), future.get().?);
+}
+
+test "Future wait with thread" {
+    var future = Future(i32){};
+
+    // Spawn a thread that completes the future after a short delay
+    const worker = try Thread.spawn(.{}, struct {
+        fn run(f: *Future(i32)) void {
+            Thread.sleep(10 * std.time.ns_per_ms);
+            f.complete(123);
+        }
+    }.run, .{&future});
+
+    // Wait should block until complete (no busy polling)
+    const result = try future.wait();
+    try std.testing.expectEqual(@as(i32, 123), result);
+
+    worker.join();
+}
+
+test "Future waitTimeout" {
+    var future = Future(i32){};
+
+    // Should timeout and return null
+    const result = try future.waitTimeout(10 * std.time.ns_per_ms);
+    try std.testing.expect(result == null);
+
+    // Now complete and try again
+    future.complete(456);
+    const result2 = try future.waitTimeout(10 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(i32, 456), result2.?);
 }

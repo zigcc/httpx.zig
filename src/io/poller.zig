@@ -228,7 +228,7 @@ const BsdKqueue = struct {
         for (raw_events[0..n], 0..) |raw, i| {
             events[i] = .{
                 .fd = @intCast(raw.ident),
-                .data = @intFromPtr(raw.udata),
+                .data = raw.udata,
                 .events = fromKqueueFilter(raw.filter, raw.flags),
             };
         }
@@ -236,18 +236,18 @@ const BsdKqueue = struct {
         return n;
     }
 
-    fn makeKevent(fd: posix.fd_t, filter: posix.system.EVFILT, flags: u16, data: usize) posix.Kevent {
+    fn makeKevent(fd: posix.fd_t, filter: i16, flags: u16, data: usize) posix.Kevent {
         return .{
             .ident = @intCast(fd),
             .filter = filter,
             .flags = flags,
             .fflags = 0,
             .data = 0,
-            .udata = @ptrFromInt(data),
+            .udata = data,
         };
     }
 
-    fn fromKqueueFilter(filter: posix.system.EVFILT, flags: u16) EventMask {
+    fn fromKqueueFilter(filter: i16, flags: u16) EventMask {
         return .{
             .readable = filter == posix.system.EVFILT.READ,
             .writable = filter == posix.system.EVFILT.WRITE,

@@ -26,6 +26,7 @@ const Allocator = std.mem.Allocator;
 const net = std.net;
 
 const Socket = @import("../net/socket.zig").Socket;
+const RingBuffer = @import("../util/ring_buffer.zig").RingBuffer;
 
 pub const WorkerPoolError = error{
     PoolStopped,
@@ -62,8 +63,8 @@ pub const WorkerPool = struct {
     allocator: Allocator,
     config: WorkerPoolConfig,
 
-    // Task queue (thread-safe)
-    queue: std.ArrayListUnmanaged(WorkItem) = .empty,
+    // Task queue (thread-safe) - using RingBuffer for O(1) operations
+    queue: ?RingBuffer(WorkItem) = null,
     queue_mutex: Thread.Mutex = .{},
     queue_not_empty: Thread.Condition = .{},
     queue_not_full: Thread.Condition = .{},
@@ -101,16 +102,22 @@ pub const WorkerPool = struct {
             const cpu_count = Thread.getCpuCount() catch 4;
             cfg.num_workers = @max(1, @as(u32, @intCast(cpu_count)));
         }
+        // Initialize ring buffer for O(1) queue operations
+        const queue = RingBuffer(WorkItem).init(allocator, cfg.max_queue_size) catch null;
         return .{
             .allocator = allocator,
             .config = cfg,
+            .queue = queue,
         };
     }
 
     /// Releases all resources associated with the worker pool.
     pub fn deinit(self: *Self) void {
         self.stop();
-        self.queue.deinit(self.allocator);
+        if (self.queue) |*q| {
+            q.deinit();
+        }
+        self.queue = null;
         if (self.workers.len > 0) {
             self.allocator.free(self.workers);
             self.workers = &.{};
@@ -167,40 +174,46 @@ pub const WorkerPool = struct {
     /// Submits a new work item to the queue.
     /// Blocks if the queue is full until space becomes available.
     pub fn submit(self: *Self, item: WorkItem) WorkerPoolError!void {
+        const q = &(self.queue orelse return WorkerPoolError.QueueFull);
+
         self.queue_mutex.lock();
         defer self.queue_mutex.unlock();
 
-        // Wait if queue is full
-        while (self.queue.items.len >= self.config.max_queue_size) {
+        // Wait if queue is full - O(1) check with RingBuffer
+        while (q.isFull()) {
             if (!self.running.load(.acquire)) return WorkerPoolError.PoolStopped;
             self.queue_not_full.wait(&self.queue_mutex);
         }
 
         if (!self.running.load(.acquire)) return WorkerPoolError.PoolStopped;
 
-        self.queue.append(self.allocator, item) catch return WorkerPoolError.QueueFull;
+        // O(1) push operation
+        q.push(item) catch return WorkerPoolError.QueueFull;
         self.queue_not_empty.signal();
 
         // Update stats
         self.stats_mutex.lock();
-        self.stats.queue_depth = self.queue.items.len;
+        self.stats.queue_depth = q.count();
         self.stats_mutex.unlock();
     }
 
     /// Tries to submit a work item without blocking.
     /// Returns error.QueueFull if the queue is at capacity.
     pub fn trySubmit(self: *Self, item: WorkItem) WorkerPoolError!void {
+        const q = &(self.queue orelse return WorkerPoolError.QueueFull);
+
         self.queue_mutex.lock();
         defer self.queue_mutex.unlock();
 
         if (!self.running.load(.acquire)) return WorkerPoolError.PoolStopped;
-        if (self.queue.items.len >= self.config.max_queue_size) return WorkerPoolError.QueueFull;
+        if (q.isFull()) return WorkerPoolError.QueueFull;
 
-        self.queue.append(self.allocator, item) catch return WorkerPoolError.QueueFull;
+        // O(1) push operation
+        q.push(item) catch return WorkerPoolError.QueueFull;
         self.queue_not_empty.signal();
 
         self.stats_mutex.lock();
-        self.stats.queue_depth = self.queue.items.len;
+        self.stats.queue_depth = q.count();
         self.stats_mutex.unlock();
     }
 
@@ -222,22 +235,22 @@ pub const WorkerPool = struct {
     }
 
     fn workerLoop(self: *Self) void {
+        const q = &(self.queue orelse return);
+
         while (self.running.load(.acquire)) {
             // Get a work item from the queue
             self.queue_mutex.lock();
-            while (self.queue.items.len == 0 and self.running.load(.acquire)) {
+            while (q.isEmpty() and self.running.load(.acquire)) {
                 self.queue_not_empty.wait(&self.queue_mutex);
             }
 
-            if (!self.running.load(.acquire) and self.queue.items.len == 0) {
+            if (!self.running.load(.acquire) and q.isEmpty()) {
                 self.queue_mutex.unlock();
                 break;
             }
 
-            // Pop from front of queue (FIFO)
-            const item = if (self.queue.items.len > 0)
-                self.queue.orderedRemove(0)
-            else {
+            // O(1) pop from front of queue (FIFO) - was O(n) with orderedRemove(0)
+            const item = q.pop() orelse {
                 self.queue_mutex.unlock();
                 continue;
             };
@@ -248,7 +261,7 @@ pub const WorkerPool = struct {
             // Update active count
             self.stats_mutex.lock();
             self.stats.active_requests += 1;
-            self.stats.queue_depth = self.queue.items.len;
+            self.stats.queue_depth = q.count();
             self.stats_mutex.unlock();
 
             // Process the work item

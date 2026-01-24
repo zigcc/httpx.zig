@@ -105,46 +105,100 @@ pub const BatchBuilder = struct {
     }
 };
 
-/// Executes all requests and waits for all to complete.
-pub fn all(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
-    var results = try allocator.alloc(RequestResult, specs.len);
+/// Default maximum concurrent requests (based on typical CPU core count).
+pub const DEFAULT_MAX_CONCURRENCY: usize = 16;
+
+/// Executes all requests with limited concurrency to avoid thread explosion.
+/// This is more efficient than spawning one thread per request.
+///
+/// `max_concurrency`: Maximum number of concurrent threads (0 = use default).
+pub fn allWithConcurrency(
+    allocator: Allocator,
+    client: *Client,
+    specs: []const RequestSpec,
+    max_concurrency: usize,
+) ![]RequestResult {
+    const results = try allocator.alloc(RequestResult, specs.len);
     errdefer allocator.free(results);
 
     if (specs.len == 0) return results;
 
-    const WorkerCtx = struct {
-        client: *Client,
-        spec: RequestSpec,
-        out: *RequestResult,
+    const concurrency = if (max_concurrency == 0) DEFAULT_MAX_CONCURRENCY else max_concurrency;
+    const num_threads = @min(concurrency, specs.len);
 
-        fn run(self: *@This()) void {
-            self.out.* = executeSpec(self.client, self.spec);
+    // Shared state for work distribution
+    const SharedState = struct {
+        client: *Client,
+        specs: []const RequestSpec,
+        results: []RequestResult,
+        next_index: std.atomic.Value(usize),
+        completed: std.atomic.Value(usize),
+        mutex: Thread.Mutex,
+        done_cond: Thread.Condition,
+
+        fn workerFn(self: *@This()) void {
+            while (true) {
+                // Atomically claim next work item
+                const idx = self.next_index.fetchAdd(1, .acq_rel);
+                if (idx >= self.specs.len) break;
+
+                // Execute request
+                self.results[idx] = executeSpec(self.client, self.specs[idx]);
+
+                // Signal completion
+                const prev = self.completed.fetchAdd(1, .acq_rel);
+                if (prev + 1 == self.specs.len) {
+                    self.mutex.lock();
+                    self.done_cond.signal();
+                    self.mutex.unlock();
+                }
+            }
         }
     };
 
-    var threads = try allocator.alloc(Thread, specs.len);
-    defer allocator.free(threads);
+    var state = SharedState{
+        .client = client,
+        .specs = specs,
+        .results = results,
+        .next_index = std.atomic.Value(usize).init(0),
+        .completed = std.atomic.Value(usize).init(0),
+        .mutex = .{},
+        .done_cond = .{},
+    };
 
-    var ctxs = try allocator.alloc(WorkerCtx, specs.len);
-    defer allocator.free(ctxs);
+    var threads = try allocator.alloc(Thread, num_threads);
+    defer allocator.free(threads);
 
     var spawned: usize = 0;
     errdefer {
-        var i: usize = 0;
-        while (i < spawned) : (i += 1) {
-            threads[i].join();
-        }
+        // Wait for all spawned threads on error
+        for (threads[0..spawned]) |t| t.join();
     }
 
-    for (specs, 0..) |spec, i| {
-        ctxs[i] = .{ .client = client, .spec = spec, .out = &results[i] };
-        threads[i] = try Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[i]});
+    // Spawn worker threads
+    for (threads) |*t| {
+        t.* = try Thread.spawn(.{}, SharedState.workerFn, .{&state});
         spawned += 1;
     }
 
+    // Wait for all work to complete
+    state.mutex.lock();
+    while (state.completed.load(.acquire) < specs.len) {
+        state.done_cond.wait(&state.mutex);
+    }
+    state.mutex.unlock();
+
+    // Join all threads
     for (threads[0..spawned]) |t| t.join();
 
     return results;
+}
+
+/// Executes all requests and waits for all to complete.
+/// Uses limited concurrency for efficiency (default: 16 concurrent threads).
+/// For custom concurrency limit, use `allWithConcurrency`.
+pub fn all(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
+    return allWithConcurrency(allocator, client, specs, DEFAULT_MAX_CONCURRENCY);
 }
 
 /// Executes all requests and returns results for each one.
