@@ -1,99 +1,47 @@
-//! httpx.zig - Production-Ready HTTP Library for Zig
+//! httpx.zig - Production-Ready HTTP Server Library for Zig
 //!
-//! A comprehensive HTTP client and server library with support for all
-//! HTTP protocol versions and modern features.
-//!
-//! ## Important Note
-//!
-//! **httpx.zig implements HTTP/2 and HTTP/3 from scratch.** Zig's standard library
-//! does not provide HTTP/2, HTTP/3, or QUIC support. This library contains complete
-//! custom implementations of these protocols:
-//!
-//! - **HTTP/2**: HPACK header compression (RFC 7541), stream multiplexing, flow control (RFC 7540)
-//! - **HTTP/3**: QPACK header compression (RFC 9204), HTTP/3 framing (RFC 9114)
-//! - **QUIC**: Transport framing, packet structures, variable-length integers (RFC 9000)
-//! - **WebSocket**: Full RFC 6455 implementation with client and server support
+//! A high-performance HTTP server library with support for modern features.
 //!
 //! ## Supported Protocols
 //!
-//! - **HTTP/1.0**: Basic request-response semantics
-//! - **HTTP/1.1**: Persistent connections, chunked transfer, pipelining
-//! - **HTTP/2**: Full implementation with HPACK compression, stream multiplexing, flow control
-//! - **HTTP/3**: QPACK compression, QUIC transport framing support
+//! - **HTTP/1.1**: Persistent connections, chunked transfer
+//! - **HTTP/2**: HPACK compression, stream multiplexing, flow control
 //! - **WebSocket**: Bidirectional real-time communication (RFC 6455)
-//!
-//! ## Platform Support
-//!
-//! - Linux (x86_64, aarch64)
-//! - Windows (x86_64)
-//! - macOS (x86_64, aarch64)
-//! - FreeBSD, NetBSD, OpenBSD
 //!
 //! ## Features
 //!
-//! ### Client Features
-//! - Connection pooling with keep-alive
-//! - Automatic retry with exponential backoff
-//! - Redirect following with configurable policies
-//! - Request/response interceptors
-//! - Concurrent request execution
-//! - TLS/SSL support (HTTPS)
-//! - Timeout configuration
-//! - Cookie handling
-//! - WebSocket client with ws:// and wss:// support
-//!
-//! ### Server Features
 //! - Express-style routing with path parameters
 //! - Middleware stack (CORS, logging, rate limiting, etc.)
 //! - Static file serving
 //! - JSON response helpers
 //! - Request context with user data
 //! - WebSocket endpoint handling with upgrade support
-//!
-//! ### Protocol Features
-//! - HTTP/2 HPACK header compression (RFC 7541)
-//! - HTTP/2 stream state machine and flow control
-//! - HTTP/3 QPACK header compression (RFC 9204)
-//! - QUIC transport framing (RFC 9000)
-//! - WebSocket frame encoding/decoding with masking (RFC 6455)
+//! - TLS/SSL support
 //!
 //! ## Quick Start
 //!
 //! ```zig
 //! const httpx = @import("httpx");
 //!
-//! // Client usage
-//! var client = httpx.Client.init(allocator);
-//! defer client.deinit();
-//! const response = try client.get("https://api.example.com/users", .{});
-//!
-//! // Server usage
 //! var server = httpx.Server.init(allocator);
 //! try server.get("/hello", helloHandler);
 //! try server.listen();
-//!
-//! // WebSocket client
-//! var ws = try httpx.WebSocketClient.connect(allocator, "ws://localhost:8080/chat", .{});
-//! defer ws.deinit();
-//! try ws.sendText("Hello!");
-//! const msg = try ws.receive();
-//! defer allocator.free(msg.payload);
 //! ```
 
 const std = @import("std");
 
+// Core types
 pub const types = @import("core/types.zig");
 pub const headers = @import("core/headers.zig");
 pub const uri = @import("core/uri.zig");
 pub const status = @import("core/status.zig");
 pub const request = @import("core/request.zig");
 pub const response = @import("core/response.zig");
-
-// New HTTP/1.1 feature modules
 pub const cookie = @import("core/cookie.zig");
 pub const auth = @import("core/auth.zig");
 pub const multipart_mod = @import("core/multipart.zig");
 
+// Protocol
 pub const http = @import("protocol/http.zig");
 pub const parser = @import("protocol/parser.zig");
 pub const hpack = @import("protocol/hpack.zig");
@@ -102,10 +50,11 @@ pub const qpack = @import("protocol/qpack.zig");
 pub const quic = @import("protocol/quic.zig");
 pub const websocket = @import("protocol/websocket.zig");
 
+// Network
 pub const socket = @import("net/socket.zig");
 pub const address = @import("net/address.zig");
 
-// I/O subsystem for event-driven programming
+// I/O subsystem
 pub const io = struct {
     pub const poller = @import("io/poller.zig");
     pub const Poller = poller.Poller;
@@ -113,53 +62,40 @@ pub const io = struct {
     pub const EventMask = poller.EventMask;
 };
 
+// TLS
 pub const tls = @import("tls/tls.zig");
 pub const tls_session_pool = @import("tls/session_pool.zig");
 
-pub const client_mod = @import("client/client.zig");
-pub const pool = @import("client/pool.zig");
-
+// Server
 pub const server_mod = @import("server/server.zig");
 pub const router = @import("server/router.zig");
 pub const middleware = @import("server/middleware.zig");
 pub const ws_handler = @import("server/ws_handler.zig");
-pub const ws_client = @import("client/ws_client.zig");
 pub const worker_pool = @import("server/worker_pool.zig");
 pub const event_server = @import("server/event_server.zig");
 
+// Utilities
 pub const buffer = @import("util/buffer.zig");
 pub const encoding = @import("util/encoding.zig");
 pub const json = @import("util/json.zig");
 pub const compression_mod = @import("util/compression.zig");
 
-pub const proxy = @import("client/proxy.zig");
-
+// Concurrency
 pub const executor = @import("concurrency/executor.zig");
-pub const concurrency = @import("concurrency/pool.zig");
 
-pub const RequestSpec = concurrency.RequestSpec;
-pub const RequestResult = concurrency.RequestResult;
-pub const BatchBuilder = concurrency.BatchBuilder;
+// ============================================================================
+// Type Exports
+// ============================================================================
 
-pub const Executor = executor.Executor;
-pub const Task = executor.Task;
-
+// Core types
 pub const Method = types.Method;
 pub const Version = types.Version;
 pub const HttpError = types.HttpError;
 pub const ContentType = types.ContentType;
 pub const Timeouts = types.Timeouts;
-pub const RetryPolicy = types.RetryPolicy;
-pub const RedirectPolicy = types.RedirectPolicy;
 pub const Http2Settings = types.Http2Settings;
-pub const Http3Settings = types.Http3Settings;
 pub const TransferEncoding = types.TransferEncoding;
 pub const ContentEncoding = types.ContentEncoding;
-
-// Specialized error types for specific modules
-pub const ParseError = parser.ParseError;
-pub const ClientError = client_mod.ClientError;
-pub const WebSocketError = ws_client.WebSocketError;
 
 pub const Headers = headers.Headers;
 pub const HeaderName = headers.HeaderName;
@@ -176,12 +112,16 @@ pub const RequestBuilder = request.RequestBuilder;
 pub const Response = response.Response;
 pub const ResponseBuilder = response.ResponseBuilder;
 
+// Parser
+pub const Parser = parser.Parser;
+pub const ParseError = parser.ParseError;
+
+// Network
 pub const Socket = socket.Socket;
 pub const TcpListener = socket.TcpListener;
 pub const UdpSocket = socket.UdpSocket;
 
-pub const Parser = parser.Parser;
-
+// HTTP protocol
 pub const Http1Connection = http.Http1Connection;
 pub const Http2Connection = http.Http2Connection;
 pub const Http2FrameType = http.Http2FrameType;
@@ -191,27 +131,30 @@ pub const Http3FrameType = http.Http3FrameType;
 pub const Http3ErrorCode = http.Http3ErrorCode;
 pub const AlpnProtocol = http.AlpnProtocol;
 pub const NegotiatedProtocol = http.NegotiatedProtocol;
+pub const formatRequest = http.formatRequest;
+pub const formatResponse = http.formatResponse;
+pub const negotiateVersion = http.negotiateVersion;
 
-// HTTP/2 HPACK exports
+// HTTP/2 HPACK
 pub const HpackContext = hpack.HpackContext;
 pub const HpackStaticTable = hpack.StaticTable;
 pub const HpackDynamicTable = hpack.DynamicTable;
 pub const encodeHpackHeaders = hpack.encodeHeaders;
 pub const decodeHpackHeaders = hpack.decodeHeaders;
 
-// HTTP/2 Stream exports
+// HTTP/2 Stream
 pub const Stream = stream.Stream;
 pub const StreamState = stream.StreamState;
 pub const StreamManager = stream.StreamManager;
 pub const StreamPriority = stream.StreamPriority;
 
-// HTTP/3 QPACK exports
+// HTTP/3 QPACK
 pub const QpackContext = qpack.QpackContext;
 pub const QpackStaticTable = qpack.StaticTable;
 pub const encodeQpackHeaders = qpack.encodeHeaders;
 pub const decodeQpackHeaders = qpack.decodeHeaders;
 
-// QUIC exports
+// QUIC
 pub const QuicVersion = quic.Version;
 pub const QuicLongHeader = quic.LongHeader;
 pub const QuicShortHeader = quic.ShortHeader;
@@ -223,53 +166,35 @@ pub const QuicCryptoFrame = quic.CryptoFrame;
 pub const QuicAckFrame = quic.AckFrame;
 pub const QuicTransportParameters = quic.TransportParameters;
 
-// WebSocket exports
-pub const WebSocketClient = ws_client.WebSocketClient;
+// WebSocket (server-side)
 pub const WebSocketConnection = ws_handler.WebSocketConnection;
 pub const WebSocketHandler = ws_handler.WebSocketHandler;
-pub const WebSocketOptions = ws_client.WebSocketOptions;
-pub const WebSocketMessage = ws_client.Message;
 pub const WsOpcode = websocket.Opcode;
 pub const WsFrame = websocket.Frame;
 pub const WsCloseCode = websocket.CloseCode;
 pub const isWebSocketUpgrade = ws_handler.isUpgradeRequest;
 
-pub const formatRequest = http.formatRequest;
-pub const formatResponse = http.formatResponse;
-pub const negotiateVersion = http.negotiateVersion;
-
-pub const Client = client_mod.Client;
-pub const ClientConfig = client_mod.ClientConfig;
-pub const RequestOptions = client_mod.RequestOptions;
-pub const Interceptor = client_mod.Interceptor;
-pub const RequestInterceptor = client_mod.RequestInterceptor;
-pub const ResponseInterceptor = client_mod.ResponseInterceptor;
-
-pub const ConnectionPool = pool.ConnectionPool;
-pub const PoolConfig = pool.PoolConfig;
-pub const Connection = pool.Connection;
-pub const PoolStats = pool.PoolStats;
-
+// Server
 pub const Server = server_mod.Server;
 pub const ServerConfig = server_mod.ServerConfig;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;
-
-// Server worker pool for multi-threading
 pub const WorkerPool = server_mod.WorkerPool;
 pub const WorkerPoolConfig = server_mod.WorkerPoolConfig;
 pub const WorkItem = server_mod.WorkItem;
 
-// Event-driven server for high concurrency
+// Event-driven server
 pub const EventServer = event_server.EventServer;
 pub const EventServerConfig = event_server.EventServerConfig;
 pub const EventConnection = event_server.Connection;
 pub const EventConnectionState = event_server.ConnectionState;
 
+// Router
 pub const Router = router.Router;
 pub const RouteGroup = router.RouteGroup;
 pub const RouteMatch = router.RouteMatch;
 
+// Middleware
 pub const Middleware = middleware.Middleware;
 pub const Next = middleware.Next;
 pub const cors = middleware.cors;
@@ -279,14 +204,17 @@ pub const rateLimit = middleware.rateLimit;
 pub const basicAuth = middleware.basicAuth;
 pub const helmet = middleware.helmet;
 
+// Buffer utilities
 pub const Buffer = buffer.Buffer;
 pub const RingBuffer = buffer.RingBuffer;
 pub const FixedBuffer = buffer.FixedBuffer;
 
+// Encoding utilities
 pub const Base64 = encoding.Base64;
 pub const Hex = encoding.Hex;
 pub const PercentEncoding = encoding.PercentEncoding;
 
+// TLS
 pub const TlsConfig = tls.TlsConfig;
 pub const TlsSession = tls.TlsSession;
 pub const TlsSessionPool = tls_session_pool.TlsSessionPool;
@@ -319,82 +247,27 @@ pub const decompress = compression_mod.decompress;
 pub const compress = compression_mod.compress;
 pub const decompressAuto = compression_mod.decompressAuto;
 
-// HTTP Proxy support
-pub const ProxyConfig = proxy.ProxyConfig;
-pub const ProxyTunnel = proxy.ProxyTunnel;
-pub const ProxyType = proxy.ProxyType;
-pub const parseProxyUrl = proxy.parseProxyUrl;
+// Executor
+pub const Executor = executor.Executor;
+pub const Task = executor.Task;
 
-/// Executes all requests in parallel and returns a result per request.
-pub fn all(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
-    return concurrency.all(allocator, client, specs);
-}
-
-/// Executes all requests in parallel and returns the first 2xx response (if any).
-pub fn any(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) !?Response {
-    return concurrency.any(allocator, client, specs);
-}
-
-/// Executes all requests in parallel and returns the first completion (success or error).
-pub fn race(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) !RequestResult {
-    return concurrency.race(allocator, client, specs);
-}
-
-/// Executes all requests in parallel and returns a settled result for each one.
-pub fn allSettled(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
-    return concurrency.allSettled(allocator, client, specs);
-}
-
-/// Convenience function to create a GET request.
-pub fn get(allocator: std.mem.Allocator, url: []const u8) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.get(url, .{});
-}
-
-/// Convenience function to create a POST request with JSON body.
-pub fn postJson(allocator: std.mem.Allocator, url: []const u8, body: []const u8) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.post(url, .{ .json = body });
-}
-
-// =============================================================================
-// WebSocket Convenience Functions
-// =============================================================================
-
-/// Connects to a WebSocket server and returns a client connection.
-/// Supports both ws:// and wss:// (TLS) URLs.
-///
-/// Example:
-/// ```zig
-/// var ws = try httpx.connectWebSocket(allocator, "ws://localhost:8080/chat", .{});
-/// defer ws.deinit();
-/// try ws.sendText("Hello!");
-/// const msg = try ws.receive();
-/// defer allocator.free(msg.payload);
-/// ```
-pub fn connectWebSocket(allocator: std.mem.Allocator, url: []const u8, options: WebSocketOptions) !WebSocketClient {
-    return WebSocketClient.connect(allocator, url, options);
-}
+// ============================================================================
+// Convenience Functions
+// ============================================================================
 
 /// Checks if an HTTP request is a WebSocket upgrade request.
-/// Useful for servers to detect incoming WebSocket connections.
 pub fn isWsUpgrade(req: *const Request) bool {
     return ws_handler.isUpgradeRequest(req);
 }
 
 /// Generates the Sec-WebSocket-Accept header value from a client's key.
-/// Used by servers to complete the WebSocket handshake.
 pub fn computeWsAcceptKey(client_key: []const u8) [28]u8 {
     return websocket.computeAccept(client_key);
 }
 
-/// Generates a random 16-byte key for the Sec-WebSocket-Key header.
-/// Used by clients initiating a WebSocket connection.
-pub fn generateWsKey() [24]u8 {
-    return websocket.generateKey();
-}
+// ============================================================================
+// Tests
+// ============================================================================
 
 test "core types" {
     _ = types;
@@ -444,10 +317,6 @@ test "websocket" {
     _ = websocket;
 }
 
-test "ws_client" {
-    _ = ws_client;
-}
-
 test "ws_handler" {
     _ = ws_handler;
 }
@@ -488,7 +357,6 @@ test "event server" {
     _ = event_server;
 }
 
-// New HTTP/1.1 feature tests
 test "cookie" {
     _ = cookie;
 }
@@ -503,8 +371,4 @@ test "multipart" {
 
 test "compression" {
     _ = compression_mod;
-}
-
-test "proxy" {
-    _ = proxy;
 }

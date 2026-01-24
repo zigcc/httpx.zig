@@ -185,11 +185,6 @@ pub fn decompressAuto(allocator: Allocator, data: []const u8, content_encoding: 
     return current;
 }
 
-/// Returns the Accept-Encoding header value for supported encodings.
-pub fn acceptEncodingHeader() []const u8 {
-    return "gzip, deflate, identity";
-}
-
 // =============================================================================
 // Tests
 // =============================================================================

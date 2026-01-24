@@ -194,8 +194,6 @@ pub const HttpError = error{
     ResponseTooLarge,
     /// Request body exceeds maximum allowed size.
     RequestTooLarge,
-    /// Exceeded maximum number of redirects.
-    TooManyRedirects,
     /// Operation timed out.
     Timeout,
 
@@ -216,12 +214,6 @@ pub const HttpError = error{
     Http3Error,
     /// QUIC transport layer error.
     QuicError,
-
-    // ===== Proxy Errors =====
-    /// Proxy connection or communication failed.
-    ProxyError,
-    /// Proxy authentication required or failed.
-    ProxyAuthenticationRequired,
 
     // ===== WebSocket Errors =====
     /// WebSocket handshake failed.
@@ -491,77 +483,6 @@ pub const Timeouts = struct {
     }
 };
 
-/// Retry policy configuration with exponential backoff support.
-pub const RetryPolicy = struct {
-    max_retries: u32 = 3,
-    initial_delay_ms: u64 = 1000,
-    max_delay_ms: u64 = 30_000,
-    backoff_multiplier: f64 = 2.0,
-    retry_on_status: []const u16 = &[_]u16{ 429, 500, 502, 503, 504 },
-    retry_on_connection_error: bool = true,
-    retry_only_idempotent: bool = true,
-
-    /// Calculates the delay for a given retry attempt using exponential backoff.
-    pub fn calculateDelay(self: RetryPolicy, attempt: u32) u64 {
-        if (attempt == 0) return 0;
-        const multiplier = std.math.pow(f64, self.backoff_multiplier, @as(f64, @floatFromInt(attempt - 1)));
-        const delay = @as(u64, @intFromFloat(@as(f64, @floatFromInt(self.initial_delay_ms)) * multiplier));
-        return @min(delay, self.max_delay_ms);
-    }
-
-    /// Returns true if the given status code should trigger a retry.
-    pub fn shouldRetryStatus(self: RetryPolicy, status: u16) bool {
-        for (self.retry_on_status) |s| {
-            if (s == status) return true;
-        }
-        return false;
-    }
-
-    /// Creates a policy that never retries.
-    pub fn noRetry() RetryPolicy {
-        return .{ .max_retries = 0 };
-    }
-
-    /// Creates an aggressive retry policy for critical requests.
-    pub fn aggressive() RetryPolicy {
-        return .{
-            .max_retries = 5,
-            .initial_delay_ms = 500,
-            .backoff_multiplier = 1.5,
-        };
-    }
-};
-
-/// Redirect policy configuration for HTTP clients.
-pub const RedirectPolicy = struct {
-    max_redirects: u32 = 10,
-    follow_redirects: bool = true,
-    preserve_method: bool = false,
-    preserve_headers: bool = true,
-    allow_cross_origin: bool = true,
-
-    /// Returns the appropriate method to use after a redirect.
-    pub fn getRedirectMethod(self: RedirectPolicy, status: u16, original: Method) Method {
-        if (self.preserve_method) return original;
-        return switch (status) {
-            301, 302 => .GET,
-            303 => .GET,
-            307, 308 => original,
-            else => original,
-        };
-    }
-
-    /// Creates a policy that doesn't follow redirects.
-    pub fn noFollow() RedirectPolicy {
-        return .{ .follow_redirects = false };
-    }
-
-    /// Creates a strict policy that preserves method on redirects.
-    pub fn strict() RedirectPolicy {
-        return .{ .preserve_method = true };
-    }
-};
-
 /// HTTP/2 specific settings as defined in RFC 7540.
 pub const Http2Settings = struct {
     header_table_size: u32 = 4096,
@@ -611,15 +532,4 @@ test "ContentType.fromString" {
     try std.testing.expectEqual(ContentType.text_html, ContentType.fromString("text/html; charset=utf-8").?);
 }
 
-test "RetryPolicy.calculateDelay" {
-    const policy = RetryPolicy{};
-    try std.testing.expectEqual(@as(u64, 0), policy.calculateDelay(0));
-    try std.testing.expectEqual(@as(u64, 1000), policy.calculateDelay(1));
-    try std.testing.expectEqual(@as(u64, 2000), policy.calculateDelay(2));
-}
 
-test "RedirectPolicy.getRedirectMethod" {
-    const policy = RedirectPolicy{};
-    try std.testing.expectEqual(Method.GET, policy.getRedirectMethod(301, .POST));
-    try std.testing.expectEqual(Method.POST, policy.getRedirectMethod(307, .POST));
-}
