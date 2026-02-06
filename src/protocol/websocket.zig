@@ -414,6 +414,10 @@ pub fn decodeFrame(allocator: Allocator, data: []const u8, max_payload_size: usi
     const opcode = Opcode.fromInt(@truncate(byte0 & 0x0F)) orelse return error.InvalidOpcode;
     offset += 1;
 
+    if (rsv1 or rsv2 or rsv3) {
+        return error.InvalidReservedBits;
+    }
+
     // Second byte
     const byte1 = data[offset];
     const masked = (byte1 & 0x80) != 0;
@@ -444,6 +448,16 @@ pub fn decodeFrame(allocator: Allocator, data: []const u8, max_payload_size: usi
         return error.InvalidControlFrame;
     }
 
+    // Control frames must not be fragmented.
+    if (opcode.isControl() and !fin) {
+        return error.InvalidControlFrame;
+    }
+
+    // Close frames must have either empty payload or at least code + optional reason.
+    if (opcode == .close and payload_len == 1) {
+        return error.InvalidControlFrame;
+    }
+
     // Masking key
     var mask: ?[4]u8 = null;
     if (masked) {
@@ -464,6 +478,10 @@ pub fn decodeFrame(allocator: Allocator, data: []const u8, max_payload_size: usi
 
     if (mask) |m| {
         applyMask(payload, m);
+    }
+
+    if (opcode == .close and payload.len > 2 and !std.unicode.utf8ValidateSlice(payload[2..])) {
+        return error.InvalidControlFrame;
     }
 
     return DecodeResult{
@@ -519,6 +537,8 @@ pub const FrameReader = struct {
     max_payload_size: usize = DEFAULT_MAX_PAYLOAD_SIZE,
     /// Maximum total size for fragmented messages (prevents DoS via infinite fragments).
     max_message_size: usize = DEFAULT_MAX_MESSAGE_SIZE,
+    /// Whether to require incoming frames to be masked.
+    require_masked: bool = false,
     /// Accumulated fragments for fragmented messages.
     fragment_buffer: std.ArrayListUnmanaged(u8) = .empty,
     fragment_opcode: ?Opcode = null,
@@ -532,6 +552,13 @@ pub const FrameReader = struct {
 
     pub fn init(allocator: Allocator) Self {
         return .{ .allocator = allocator };
+    }
+
+    pub fn initServer(allocator: Allocator) Self {
+        return .{
+            .allocator = allocator,
+            .require_masked = true,
+        };
     }
 
     pub fn initWithLimits(allocator: Allocator, max_payload: usize, max_message: usize) Self {
@@ -592,6 +619,11 @@ pub const FrameReader = struct {
 
             const frame = result.frame;
 
+            if (self.require_masked and frame.mask == null) {
+                self.allocator.free(result.payload_owned);
+                return error.UnmaskedFrame;
+            }
+
             // Control frames are returned immediately
             if (frame.opcode.isControl()) {
                 return .{ .opcode = frame.opcode, .payload = result.payload_owned };
@@ -619,6 +651,10 @@ pub const FrameReader = struct {
                 }
 
                 if (frame.fin) {
+                    if (frame.opcode == .text and !std.unicode.utf8ValidateSlice(result.payload_owned)) {
+                        self.allocator.free(result.payload_owned);
+                        return error.InvalidUtf8;
+                    }
                     // Complete unfragmented message
                     return .{ .opcode = frame.opcode, .payload = result.payload_owned };
                 }
@@ -640,6 +676,12 @@ pub const FrameReader = struct {
                 const opcode = self.fragment_opcode.?;
                 const payload = try self.fragment_buffer.toOwnedSlice(self.allocator);
                 self.fragment_opcode = null;
+
+                if (opcode == .text and !std.unicode.utf8ValidateSlice(payload)) {
+                    self.allocator.free(payload);
+                    return error.InvalidUtf8;
+                }
+
                 return .{ .opcode = opcode, .payload = payload };
             }
         }
@@ -881,6 +923,30 @@ test "decodeFrame rejects oversized control frame" {
     try std.testing.expectError(error.InvalidControlFrame, result);
 }
 
+test "decodeFrame rejects control frame fragmentation" {
+    const allocator = std.testing.allocator;
+    const data = [_]u8{ 0x09, 0x00 }; // FIN=0, ping opcode
+
+    const result = decodeFrame(allocator, &data, DEFAULT_MAX_PAYLOAD_SIZE);
+    try std.testing.expectError(error.InvalidControlFrame, result);
+}
+
+test "decodeFrame rejects invalid reserved bits" {
+    const allocator = std.testing.allocator;
+    const data = [_]u8{ 0xC1, 0x00 }; // RSV1=1, text frame, empty payload
+
+    const result = decodeFrame(allocator, &data, DEFAULT_MAX_PAYLOAD_SIZE);
+    try std.testing.expectError(error.InvalidReservedBits, result);
+}
+
+test "decodeFrame rejects close payload length one" {
+    const allocator = std.testing.allocator;
+    const data = [_]u8{ 0x88, 0x01, 0x03 };
+
+    const result = decodeFrame(allocator, &data, DEFAULT_MAX_PAYLOAD_SIZE);
+    try std.testing.expectError(error.InvalidControlFrame, result);
+}
+
 test "FrameReader handles fragmented message" {
     const allocator = std.testing.allocator;
     var reader = FrameReader.init(allocator);
@@ -920,6 +986,30 @@ test "FrameReader returns control frames immediately" {
     try std.testing.expectEqual(Opcode.ping, msg.?.opcode);
     try std.testing.expectEqualStrings("ping", msg.?.payload);
     allocator.free(msg.?.payload);
+}
+
+test "FrameReader server mode requires masked frames" {
+    const allocator = std.testing.allocator;
+    var reader = FrameReader.initServer(allocator);
+    defer reader.deinit();
+
+    const unmasked = [_]u8{ 0x81, 0x02, 'H', 'i' };
+    try reader.feed(&unmasked);
+
+    const result = reader.readMessage();
+    try std.testing.expectError(error.UnmaskedFrame, result);
+}
+
+test "FrameReader validates UTF-8 for text messages" {
+    const allocator = std.testing.allocator;
+    var reader = FrameReader.init(allocator);
+    defer reader.deinit();
+
+    const invalid_utf8 = [_]u8{ 0x81, 0x02, 0xC3, 0x28 };
+    try reader.feed(&invalid_utf8);
+
+    const result = reader.readMessage();
+    try std.testing.expectError(error.InvalidUtf8, result);
 }
 
 test "FrameReader delayed compaction" {

@@ -79,7 +79,7 @@ pub const WebSocketConnection = struct {
             .allocator = allocator,
             .transport = .{ .socket = socket },
             .state = .open,
-            .frame_reader = ws.FrameReader.init(allocator),
+            .frame_reader = ws.FrameReader.initServer(allocator),
         };
     }
 
@@ -89,7 +89,7 @@ pub const WebSocketConnection = struct {
             .allocator = allocator,
             .transport = .{ .stream = stream },
             .state = .open,
-            .frame_reader = ws.FrameReader.init(allocator),
+            .frame_reader = ws.FrameReader.initServer(allocator),
         };
     }
 
@@ -175,6 +175,9 @@ pub const WebSocketConnection = struct {
     /// Receives the next message.
     /// Handles control frames automatically.
     pub fn receive(self: *Self) !Message {
+        self.frame_reader.max_payload_size = self.max_message_size;
+        self.frame_reader.max_message_size = self.max_message_size;
+
         while (true) {
             // Try to decode from buffer
             if (try self.frame_reader.readMessage()) |msg| {
@@ -277,6 +280,9 @@ pub const Message = struct {
 
 /// Checks if an HTTP request is a WebSocket upgrade request.
 pub fn isUpgradeRequest(request: *const Request) bool {
+    if (request.method != .GET) return false;
+    if (request.version != .HTTP_1_1) return false;
+
     // Check for required headers
     const upgrade = request.headers.get(HeaderName.UPGRADE) orelse return false;
     const connection = request.headers.get(HeaderName.CONNECTION) orelse return false;
@@ -285,11 +291,28 @@ pub fn isUpgradeRequest(request: *const Request) bool {
 
     // Validate values
     if (!eqlIgnoreCase(upgrade, "websocket")) return false;
-    if (mem.indexOf(u8, connection, "Upgrade") == null and
-        mem.indexOf(u8, connection, "upgrade") == null) return false;
-    if (key.len == 0) return false;
+    if (!headerHasToken(connection, "Upgrade")) return false;
+    if (!isValidWebSocketKey(key)) return false;
     if (!mem.eql(u8, version, ws.WEBSOCKET_VERSION)) return false;
 
+    return true;
+}
+
+fn headerHasToken(value: []const u8, token: []const u8) bool {
+    var iter = mem.splitScalar(u8, value, ',');
+    while (iter.next()) |part| {
+        const trimmed = mem.trim(u8, part, " \t");
+        if (eqlIgnoreCase(trimmed, token)) return true;
+    }
+    return false;
+}
+
+fn isValidWebSocketKey(key: []const u8) bool {
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(key) catch return false;
+    if (decoded_len != 16) return false;
+
+    var decoded: [16]u8 = undefined;
+    std.base64.standard.Decoder.decode(&decoded, key) catch return false;
     return true;
 }
 
@@ -437,6 +460,48 @@ test "isUpgradeRequest case insensitive upgrade header" {
     try req.headers.set("Sec-WebSocket-Version", "13");
 
     try std.testing.expect(isUpgradeRequest(&req));
+}
+
+test "isUpgradeRequest accepts tokenized connection header" {
+    const allocator = std.testing.allocator;
+
+    var req = try Request.init(allocator, .GET, "/chat");
+    defer req.deinit();
+
+    try req.headers.set("Upgrade", "websocket");
+    try req.headers.set("Connection", "keep-alive, UpGrAdE");
+    try req.headers.set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    try req.headers.set("Sec-WebSocket-Version", "13");
+
+    try std.testing.expect(isUpgradeRequest(&req));
+}
+
+test "isUpgradeRequest rejects invalid websocket key" {
+    const allocator = std.testing.allocator;
+
+    var req = try Request.init(allocator, .GET, "/chat");
+    defer req.deinit();
+
+    try req.headers.set("Upgrade", "websocket");
+    try req.headers.set("Connection", "Upgrade");
+    try req.headers.set("Sec-WebSocket-Key", "not-base64");
+    try req.headers.set("Sec-WebSocket-Version", "13");
+
+    try std.testing.expect(!isUpgradeRequest(&req));
+}
+
+test "isUpgradeRequest rejects non-GET method" {
+    const allocator = std.testing.allocator;
+
+    var req = try Request.init(allocator, .POST, "/chat");
+    defer req.deinit();
+
+    try req.headers.set("Upgrade", "websocket");
+    try req.headers.set("Connection", "Upgrade");
+    try req.headers.set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    try req.headers.set("Sec-WebSocket-Version", "13");
+
+    try std.testing.expect(!isUpgradeRequest(&req));
 }
 
 test "generateUpgradeResponse" {

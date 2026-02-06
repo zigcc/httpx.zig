@@ -332,10 +332,24 @@ pub const Server = struct {
                 continue;
             };
 
+            const max_connections: u64 = if (self.config.max_connections == 0)
+                std.math.maxInt(u64)
+            else
+                self.config.max_connections;
+            const prev_active = self.active_requests.fetchAdd(1, .monotonic);
+            if (prev_active >= max_connections) {
+                _ = self.active_requests.fetchSub(1, .monotonic);
+                _ = self.total_errors.fetchAdd(1, .monotonic);
+                self.sendErrorStream(conn, 503, .none) catch {};
+                conn.close();
+                continue;
+            }
+
             errdefer conn.close();
 
             group.spawn(handleConnectionTask, .{ self, conn }) catch |err| {
                 std.debug.print("Spawn error: {}\n", .{err});
+                _ = self.active_requests.fetchSub(1, .monotonic);
                 _ = self.total_errors.fetchAdd(1, .monotonic);
                 conn.close();
                 continue;
@@ -356,7 +370,6 @@ pub const Server = struct {
     }
 
     fn handleConnectionTask(self: *Self, stream: zio.net.Stream) anyerror!void {
-        _ = self.active_requests.fetchAdd(1, .monotonic);
         defer _ = self.active_requests.fetchSub(1, .monotonic);
 
         var conn_stream = stream;
@@ -370,21 +383,77 @@ pub const Server = struct {
         var buffer: [8192]u8 = undefined;
         var parser = Parser.init(self.allocator);
         defer parser.deinit();
+        parser.max_body_size = self.config.max_body_size;
+
+        var pending = std.ArrayListUnmanaged(u8){};
+        defer pending.deinit(self.allocator);
+        var pending_offset: usize = 0;
+
+        const request_timeout = self.requestIoTimeout();
+        const keep_alive_timeout = self.keepAliveIoTimeout();
 
         while (self.running.load(.acquire)) {
             parser.reset();
 
-            while (!parser.isComplete()) {
-                const n = conn_stream.read(&buffer, .none) catch |err| {
-                    _ = self.total_errors.fetchAdd(1, .monotonic);
-                    return err;
+            var waiting_for_first_byte = pending_offset >= pending.items.len;
+
+            while (!parser.isComplete() and !parser.isError()) {
+                if (pending_offset < pending.items.len) {
+                    const consumed = parser.feed(pending.items[pending_offset..]) catch |err| {
+                        _ = self.total_errors.fetchAdd(1, .monotonic);
+                        self.sendErrorStream(conn_stream, statusCodeForParseError(err), request_timeout) catch {};
+                        return;
+                    };
+
+                    if (consumed > 0) {
+                        waiting_for_first_byte = false;
+                    }
+
+                    pending_offset += consumed;
+                    if (pending_offset == pending.items.len) {
+                        pending.clearRetainingCapacity();
+                        pending_offset = 0;
+                    } else if (pending_offset >= 4096) {
+                        compactPendingBuffer(&pending, &pending_offset);
+                    }
+
+                    if (parser.isComplete() or parser.isError()) {
+                        break;
+                    }
+
+                    if (consumed > 0) {
+                        continue;
+                    }
+                }
+
+                const read_timeout = if (waiting_for_first_byte) keep_alive_timeout else request_timeout;
+                const n = conn_stream.read(&buffer, read_timeout) catch |err| switch (err) {
+                    error.Timeout => {
+                        if (waiting_for_first_byte) {
+                            return;
+                        }
+                        _ = self.total_errors.fetchAdd(1, .monotonic);
+                        self.sendErrorStream(conn_stream, 408, request_timeout) catch {};
+                        return;
+                    },
+                    else => {
+                        _ = self.total_errors.fetchAdd(1, .monotonic);
+                        return err;
+                    },
                 };
 
                 if (n == 0) {
                     return;
                 }
 
-                _ = try parser.feed(buffer[0..n]);
+                waiting_for_first_byte = false;
+                try pending.appendSlice(self.allocator, buffer[0..n]);
+            }
+
+            if (parser.isError()) {
+                _ = self.total_errors.fetchAdd(1, .monotonic);
+                try self.sendErrorStream(conn_stream, 400, request_timeout);
+                return;
             }
 
             var req = try Request.init(
@@ -410,6 +479,13 @@ pub const Server = struct {
                         _ = self.total_errors.fetchAdd(1, .monotonic);
                         return err;
                     };
+
+                    if (pending_offset < pending.items.len) {
+                        try ws_conn.frame_reader.feed(pending.items[pending_offset..]);
+                        pending.clearRetainingCapacity();
+                        pending_offset = 0;
+                    }
+
                     should_close_stream = false;
                     defer ws_conn.deinit();
 
@@ -420,7 +496,7 @@ pub const Server = struct {
                     return;
                 }
 
-                try self.sendErrorStream(conn_stream, 404);
+                try self.sendErrorStream(conn_stream, 404, request_timeout);
                 return;
             }
 
@@ -430,7 +506,7 @@ pub const Server = struct {
             const route_result = self.router.find(req.method, req.uri.path);
 
             if (route_result == null) {
-                try self.sendErrorStream(conn_stream, 404);
+                try self.sendErrorStream(conn_stream, 404, request_timeout);
                 if (!self.shouldKeepAlive(&req)) return;
                 continue;
             }
@@ -443,7 +519,7 @@ pub const Server = struct {
             var response = matched_route.handler(&ctx) catch |err| {
                 std.debug.print("Handler error: {}\n", .{err});
                 _ = self.total_errors.fetchAdd(1, .monotonic);
-                try self.sendErrorStream(conn_stream, 500);
+                try self.sendErrorStream(conn_stream, 500, request_timeout);
                 if (!self.shouldKeepAlive(&req)) return;
                 continue;
             };
@@ -453,7 +529,7 @@ pub const Server = struct {
             const formatted = try http.formatResponse(&response, self.allocator);
             defer self.allocator.free(formatted);
 
-            try conn_stream.writeAll(formatted, .none);
+            try conn_stream.writeAll(formatted, request_timeout);
             _ = self.requests_handled.fetchAdd(1, .monotonic);
 
             if (!self.shouldKeepAlive(&req)) {
@@ -462,14 +538,27 @@ pub const Server = struct {
         }
     }
 
-    fn sendErrorStream(self: *Self, stream: zio.net.Stream, code: u16) !void {
+    fn sendErrorStream(self: *Self, stream: zio.net.Stream, code: u16, timeout: zio.Timeout) !void {
         var resp = Response.init(self.allocator, code);
         defer resp.deinit();
 
         const formatted = try http.formatResponse(&resp, self.allocator);
         defer self.allocator.free(formatted);
 
-        try stream.writeAll(formatted, .none);
+        try stream.writeAll(formatted, timeout);
+    }
+
+    fn requestIoTimeout(self: *const Self) zio.Timeout {
+        return timeoutFromMs(self.config.request_timeout_ms);
+    }
+
+    fn keepAliveIoTimeout(self: *const Self) zio.Timeout {
+        return timeoutFromMs(self.config.keep_alive_timeout_ms);
+    }
+
+    fn timeoutFromMs(ms: u64) zio.Timeout {
+        if (ms == 0) return .none;
+        return zio.Timeout.fromMilliseconds(ms);
     }
 
     fn shouldKeepAlive(self: *const Self, req: *const Request) bool {
@@ -499,6 +588,27 @@ pub const Server = struct {
         return @intCast(count);
     }
 };
+
+fn statusCodeForParseError(err: anyerror) u16 {
+    return switch (err) {
+        types.HttpError.RequestTooLarge => 413,
+        types.HttpError.HeaderTooLarge,
+        types.HttpError.TooManyHeaders,
+        => 431,
+        else => 400,
+    };
+}
+
+fn compactPendingBuffer(buffer: *std.ArrayListUnmanaged(u8), offset: *usize) void {
+    if (offset.* == 0) return;
+
+    const remaining = buffer.items.len - offset.*;
+    if (remaining > 0) {
+        std.mem.copyForwards(u8, buffer.items[0..remaining], buffer.items[offset.*..]);
+    }
+    buffer.shrinkRetainingCapacity(remaining);
+    offset.* = 0;
+}
 
 const ListenThreadContext = struct {
     server: *Server,
@@ -808,6 +918,250 @@ test "Server handles keep-alive requests on same connection" {
     try std.testing.expectEqual(@as(u64, 0), stats.total_errors);
 }
 
+test "Server handles pipelined requests in single packet" {
+    const allocator = std.testing.allocator;
+    const port = try reserveTestPort();
+
+    var server = Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+    });
+    defer server.deinit();
+
+    try server.get("/pipe", struct {
+        fn handler(ctx: *Context) anyerror!Response {
+            return ctx.text("pipe-ok");
+        }
+    }.handler);
+
+    var listen_ctx = ListenThreadContext{ .server = &server };
+    var listen_thread = try std.Thread.spawn(.{}, runServerInThread, .{&listen_ctx});
+    var joined = false;
+    defer {
+        server.stop();
+        if (!joined) {
+            listen_thread.join();
+        }
+    }
+
+    try waitForServerReady(port, 2000);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", port);
+    var client = try socket_mod.Socket.createForAddress(addr);
+    defer client.close();
+
+    try client.setRecvTimeout(2000);
+    try client.setSendTimeout(2000);
+    try client.connect(addr);
+
+    try client.sendAll(
+        "GET /pipe HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Connection: keep-alive\r\n" ++
+            "\r\n" ++
+            "GET /pipe HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
+    );
+
+    const resp1 = try readHttpResponse(allocator, &client);
+    defer allocator.free(resp1);
+    try std.testing.expect(std.mem.indexOf(u8, resp1, "HTTP/1.1 200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp1, "pipe-ok") != null);
+
+    const resp2 = try readHttpResponse(allocator, &client);
+    defer allocator.free(resp2);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "HTTP/1.1 200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "pipe-ok") != null);
+
+    server.stop();
+    listen_thread.join();
+    joined = true;
+
+    if (listen_ctx.err) |err| {
+        return err;
+    }
+
+    const stats = server.getStats();
+    try std.testing.expectEqual(@as(u64, 2), stats.requests_handled);
+}
+
+test "Server returns 400 for malformed request" {
+    const allocator = std.testing.allocator;
+    const port = try reserveTestPort();
+
+    var server = Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+    });
+    defer server.deinit();
+
+    var listen_ctx = ListenThreadContext{ .server = &server };
+    var listen_thread = try std.Thread.spawn(.{}, runServerInThread, .{&listen_ctx});
+    var joined = false;
+    defer {
+        server.stop();
+        if (!joined) {
+            listen_thread.join();
+        }
+    }
+
+    try waitForServerReady(port, 2000);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", port);
+    var client = try socket_mod.Socket.createForAddress(addr);
+    defer client.close();
+
+    try client.setRecvTimeout(2000);
+    try client.setSendTimeout(2000);
+    try client.connect(addr);
+
+    try client.sendAll("BROKEN\r\n\r\n");
+
+    const response = try readHttpResponse(allocator, &client);
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 400 Bad Request") != null);
+
+    server.stop();
+    listen_thread.join();
+    joined = true;
+
+    if (listen_ctx.err) |err| {
+        return err;
+    }
+}
+
+test "Server enforces max body size" {
+    const allocator = std.testing.allocator;
+    const port = try reserveTestPort();
+
+    var server = Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .max_body_size = 4,
+    });
+    defer server.deinit();
+
+    var listen_ctx = ListenThreadContext{ .server = &server };
+    var listen_thread = try std.Thread.spawn(.{}, runServerInThread, .{&listen_ctx});
+    var joined = false;
+    defer {
+        server.stop();
+        if (!joined) {
+            listen_thread.join();
+        }
+    }
+
+    try waitForServerReady(port, 2000);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", port);
+    var client = try socket_mod.Socket.createForAddress(addr);
+    defer client.close();
+
+    try client.setRecvTimeout(2000);
+    try client.setSendTimeout(2000);
+    try client.connect(addr);
+
+    try client.sendAll(
+        "POST /upload HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Content-Length: 10\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n" ++
+            "0123456789",
+    );
+
+    const response = try readHttpResponse(allocator, &client);
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 413 Payload Too Large") != null);
+
+    server.stop();
+    listen_thread.join();
+    joined = true;
+
+    if (listen_ctx.err) |err| {
+        return err;
+    }
+}
+
+test "Server enforces max connections" {
+    const allocator = std.testing.allocator;
+    const port = try reserveTestPort();
+
+    var server = Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .max_connections = 1,
+        .keep_alive_timeout_ms = 1000,
+    });
+    defer server.deinit();
+
+    try server.get("/hold", struct {
+        fn handler(ctx: *Context) anyerror!Response {
+            return ctx.text("held");
+        }
+    }.handler);
+
+    var listen_ctx = ListenThreadContext{ .server = &server };
+    var listen_thread = try std.Thread.spawn(.{}, runServerInThread, .{&listen_ctx});
+    var joined = false;
+    defer {
+        server.stop();
+        if (!joined) {
+            listen_thread.join();
+        }
+    }
+
+    try waitForServerReady(port, 2000);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", port);
+
+    var client1 = try socket_mod.Socket.createForAddress(addr);
+    defer client1.close();
+    try client1.setRecvTimeout(2000);
+    try client1.setSendTimeout(2000);
+    try client1.connect(addr);
+
+    try client1.sendAll(
+        "GET /hold HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Connection: keep-alive\r\n" ++
+            "\r\n",
+    );
+
+    const held_resp = try readHttpResponse(allocator, &client1);
+    defer allocator.free(held_resp);
+    try std.testing.expect(std.mem.indexOf(u8, held_resp, "HTTP/1.1 200 OK") != null);
+
+    var client2 = try socket_mod.Socket.createForAddress(addr);
+    defer client2.close();
+    try client2.setRecvTimeout(2000);
+    try client2.setSendTimeout(2000);
+    try client2.connect(addr);
+
+    try client2.sendAll(
+        "GET /hold HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
+    );
+
+    const limited_resp = try readHttpResponse(allocator, &client2);
+    defer allocator.free(limited_resp);
+    try std.testing.expect(std.mem.indexOf(u8, limited_resp, "HTTP/1.1 503 Service Unavailable") != null);
+
+    server.stop();
+    listen_thread.join();
+    joined = true;
+
+    if (listen_ctx.err) |err| {
+        return err;
+    }
+}
+
 test "Server websocket upgrade and echo on zio stream" {
     const allocator = std.testing.allocator;
     const port = try reserveTestPort();
@@ -905,6 +1259,98 @@ test "Server websocket upgrade and echo on zio stream" {
 
     const stats = server.getStats();
     try std.testing.expectEqual(@as(u64, 0), stats.total_errors);
+}
+
+test "Server websocket upgrade preserves same-packet frame bytes" {
+    const allocator = std.testing.allocator;
+    const port = try reserveTestPort();
+
+    var server = Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+    });
+    defer server.deinit();
+
+    try server.ws("/ws", struct {
+        fn handler(conn: *ws_handler.WebSocketConnection) anyerror!void {
+            const msg = try conn.receive();
+            defer conn.allocator.free(msg.payload);
+            try conn.send(msg.payload, msg.opcode);
+        }
+    }.handler);
+
+    var listen_ctx = ListenThreadContext{ .server = &server };
+    var listen_thread = try std.Thread.spawn(.{}, runServerInThread, .{&listen_ctx});
+    var joined = false;
+    defer {
+        server.stop();
+        if (!joined) {
+            listen_thread.join();
+        }
+    }
+
+    try waitForServerReady(port, 2000);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", port);
+    var client = try socket_mod.Socket.createForAddress(addr);
+    defer client.close();
+
+    try client.setRecvTimeout(2000);
+    try client.setSendTimeout(2000);
+    try client.connect(addr);
+
+    const ws_key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const encoded = try websocket.encodeFrame(allocator, .{
+        .opcode = .text,
+        .mask = .{ 0x09, 0x08, 0x07, 0x06 },
+        .payload = "same-packet",
+    }, true);
+    defer allocator.free(encoded);
+
+    var request_and_frame = std.ArrayListUnmanaged(u8){};
+    defer request_and_frame.deinit(allocator);
+    try request_and_frame.appendSlice(
+        allocator,
+        "GET /ws HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: " ++ ws_key ++ "\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "\r\n",
+    );
+    try request_and_frame.appendSlice(allocator, encoded);
+
+    try client.sendAll(request_and_frame.items);
+
+    const handshake = try readHttpResponse(allocator, &client);
+    defer allocator.free(handshake);
+    try std.testing.expect(std.mem.indexOf(u8, handshake, "HTTP/1.1 101 Switching Protocols") != null);
+
+    var frame_bytes = std.ArrayListUnmanaged(u8){};
+    defer frame_bytes.deinit(allocator);
+
+    var decoded: ?websocket.DecodeResult = null;
+    while (decoded == null) {
+        var chunk: [256]u8 = undefined;
+        const n = try client.recv(&chunk);
+        if (n == 0) return error.UnexpectedEof;
+        try frame_bytes.appendSlice(allocator, chunk[0..n]);
+        decoded = try websocket.decodeFrame(allocator, frame_bytes.items, websocket.DEFAULT_MAX_PAYLOAD_SIZE);
+    }
+
+    const echo = decoded.?;
+    defer allocator.free(echo.payload_owned);
+    try std.testing.expectEqual(websocket.Opcode.text, echo.frame.opcode);
+    try std.testing.expectEqualStrings("same-packet", echo.frame.payload);
+
+    server.stop();
+    listen_thread.join();
+    joined = true;
+
+    if (listen_ctx.err) |err| {
+        return err;
+    }
 }
 
 test "Server handles concurrent requests and updates stats" {
