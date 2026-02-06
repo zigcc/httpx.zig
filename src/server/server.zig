@@ -17,7 +17,7 @@
 //!
 //! ```zig
 //! var server = Server.init(allocator);
-//! try server.enableThreading(.{ .num_workers = 8 });
+//! server.enableThreading(.{ .num_workers = 8 });
 //! try server.get("/hello", helloHandler);
 //! try server.listen();
 //! ```
@@ -25,7 +25,7 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const net = std.net;
+const zio = @import("zio");
 
 const types = @import("../core/types.zig");
 const Request = @import("../core/request.zig").Request;
@@ -35,19 +35,12 @@ const Headers = @import("../core/headers.zig").Headers;
 const HeaderName = @import("../core/headers.zig").HeaderName;
 const Parser = @import("../protocol/parser.zig").Parser;
 const http = @import("../protocol/http.zig");
-const Socket = @import("../net/socket.zig").Socket;
-const TcpListener = @import("../net/socket.zig").TcpListener;
+const socket_mod = @import("../net/socket.zig");
+const websocket = @import("../protocol/websocket.zig");
 const Router = @import("router.zig").Router;
 const Middleware = @import("middleware.zig").Middleware;
 const ws_handler = @import("ws_handler.zig");
 const WebSocketHandler = ws_handler.WebSocketHandler;
-const WebSocketConnection = ws_handler.WebSocketConnection;
-
-// Worker pool for multi-threaded mode
-pub const worker_pool = @import("worker_pool.zig");
-pub const WorkerPool = worker_pool.WorkerPool;
-pub const WorkerPoolConfig = worker_pool.WorkerPoolConfig;
-pub const WorkItem = worker_pool.WorkItem;
 
 /// Server configuration.
 pub const ServerConfig = struct {
@@ -59,6 +52,21 @@ pub const ServerConfig = struct {
     max_connections: u32 = 1000,
     keep_alive: bool = true,
     threads: u32 = 0,
+};
+
+/// Config for tuning concurrent request processing.
+pub const ThreadingConfig = struct {
+    /// Number of ZIO executors used by the runtime.
+    /// 0 means auto-detect CPU count.
+    num_workers: u32 = 0,
+};
+
+/// Runtime statistics snapshot.
+pub const RuntimeStats = struct {
+    requests_handled: u64,
+    active_requests: u64,
+    total_errors: u64,
+    executors: u32,
 };
 
 /// Request context passed to handlers.
@@ -170,12 +178,16 @@ pub const Server = struct {
     router: Router,
     middleware: std.ArrayListUnmanaged(Middleware) = .empty,
     ws_handlers: std.StringHashMapUnmanaged(WebSocketHandler) = .{},
-    listener: ?TcpListener = null,
-    running: bool = false,
+    listener: ?zio.net.Server = null,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    // Multi-threading support
-    pool: ?WorkerPool = null,
+    // Runtime concurrency preference
     threading_enabled: bool = false,
+
+    // Runtime stats
+    requests_handled: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    active_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    total_errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     const Self = @This();
 
@@ -195,40 +207,31 @@ pub const Server = struct {
 
     /// Releases all server resources.
     pub fn deinit(self: *Self) void {
-        if (self.pool) |*p| {
-            p.deinit();
-            self.pool = null;
-        }
+        self.stop();
         self.router.deinit();
         self.middleware.deinit(self.allocator);
         self.ws_handlers.deinit(self.allocator);
-        if (self.listener) |*l| l.deinit();
     }
 
     /// Enables multi-threaded request handling.
     ///
-    /// When enabled, incoming connections are dispatched to a pool of worker
-    /// threads for concurrent processing. This significantly improves throughput
-    /// under load.
+    /// When enabled, the server runs with multiple ZIO executors for concurrent
+    /// request processing.
     ///
     /// Example:
     /// ```zig
     /// var server = Server.init(allocator);
-    /// try server.enableThreading(.{ .num_workers = 8 });
+    /// server.enableThreading(.{ .num_workers = 8 });
     /// ```
-    pub fn enableThreading(self: *Self, config: WorkerPoolConfig) void {
-        self.pool = WorkerPool.init(self.allocator, config);
-        self.pool.?.setHandler(handleConnectionFromPool, @ptrCast(self));
+    pub fn enableThreading(self: *Self, config: ThreadingConfig) void {
         self.threading_enabled = true;
+        self.config.threads = config.num_workers;
     }
 
     /// Disables multi-threaded request handling.
     pub fn disableThreading(self: *Self) void {
-        if (self.pool) |*p| {
-            p.deinit();
-            self.pool = null;
-        }
         self.threading_enabled = false;
+        self.config.threads = 1;
     }
 
     /// Returns true if multi-threading is enabled.
@@ -236,12 +239,14 @@ pub const Server = struct {
         return self.threading_enabled;
     }
 
-    /// Returns the worker pool statistics (if threading is enabled).
-    pub fn getWorkerStats(self: *Self) ?WorkerPool.Stats {
-        if (self.pool) |*p| {
-            return p.getStats();
-        }
-        return null;
+    /// Returns runtime statistics.
+    pub fn getStats(self: *const Self) RuntimeStats {
+        return .{
+            .requests_handled = self.requests_handled.load(.acquire),
+            .active_requests = self.active_requests.load(.acquire),
+            .total_errors = self.total_errors.load(.acquire),
+            .executors = self.config.threads,
+        };
     }
 
     /// Adds middleware to the server.
@@ -291,177 +296,348 @@ pub const Server = struct {
 
     /// Starts the server and begins accepting connections.
     ///
-    /// In single-threaded mode (default), connections are handled sequentially.
-    /// In multi-threaded mode (after calling `enableThreading`), connections
-    /// are dispatched to worker threads for concurrent processing.
+    /// Uses ZIO runtime and async network primitives for all connections.
     pub fn listen(self: *Self) !void {
-        const addr = try net.Address.parseIp(self.config.host, self.config.port);
-        self.listener = try TcpListener.init(addr);
-        self.running = true;
+        if (self.running.load(.acquire)) return;
+        self.running.store(true, .release);
 
-        // Start worker pool if threading is enabled
-        if (self.pool) |*p| {
-            try p.start();
+        const executors = self.resolveExecutorCount();
+        const rt = try zio.Runtime.init(self.allocator, .{ .executors = .exact(executors) });
+        defer rt.deinit();
+
+        const addr = try zio.net.IpAddress.parseIp(self.config.host, self.config.port);
+        self.listener = try addr.listen(.{});
+        defer {
+            if (self.listener) |listener| {
+                listener.close();
+            }
+            self.listener = null;
+            self.running.store(false, .release);
         }
 
-        const mode_str = if (self.threading_enabled) "multi-threaded" else "single-threaded";
-        const workers = if (self.pool) |*p| p.workerCount() else @as(u32, 1);
-        std.debug.print("Server listening on {s}:{d} ({s}, {d} workers)\n", .{
+        std.debug.print("Server listening on {s}:{d} (zio async, {d} executors)\n", .{
             self.config.host,
             self.config.port,
-            mode_str,
-            workers,
+            executors,
         });
 
-        while (self.running) {
-            const conn = self.listener.?.accept() catch |err| {
+        var group: zio.Group = .init;
+        defer group.cancel();
+
+        while (self.running.load(.acquire)) {
+            const listener = self.listener orelse break;
+            const conn = listener.accept() catch |err| {
+                if (!self.running.load(.acquire)) break;
                 std.debug.print("Accept error: {}\n", .{err});
                 continue;
             };
 
-            if (self.threading_enabled) {
-                // Multi-threaded mode: dispatch to worker pool
-                if (self.pool) |*p| {
-                    p.submit(.{
-                        .socket = conn.socket,
-                        .client_addr = conn.addr,
-                        .accepted_at = std.time.milliTimestamp(),
-                    }) catch |err| {
-                        std.debug.print("Worker pool submit error: {}\n", .{err});
-                        var sock = conn.socket;
-                        sock.close();
-                    };
-                }
-            } else {
-                // Single-threaded mode: handle directly
-                self.handleConnection(conn.socket) catch |err| {
-                    std.debug.print("Handler error: {}\n", .{err});
-                };
-            }
+            errdefer conn.close();
+
+            group.spawn(handleConnectionTask, .{ self, conn }) catch |err| {
+                std.debug.print("Spawn error: {}\n", .{err});
+                _ = self.total_errors.fetchAdd(1, .monotonic);
+                conn.close();
+                continue;
+            };
         }
+
+        group.wait() catch {};
     }
 
     /// Stops the server gracefully.
-    ///
-    /// In multi-threaded mode, this will wait for all worker threads to finish
-    /// processing their current requests before returning.
     pub fn stop(self: *Self) void {
-        self.running = false;
+        self.running.store(false, .release);
 
-        // Stop worker pool first
-        if (self.pool) |*p| {
-            p.stop();
-        }
-
-        if (self.listener) |*l| {
-            l.deinit();
+        if (self.listener) |listener| {
+            listener.close();
             self.listener = null;
         }
     }
 
-    /// Callback for worker pool to handle connections.
-    fn handleConnectionFromPool(item: *WorkItem, ctx: ?*anyopaque) void {
-        const self: *Self = @ptrCast(@alignCast(ctx.?));
-        self.handleConnection(item.socket) catch |err| {
-            std.debug.print("Worker handler error: {}\n", .{err});
-            if (self.pool) |*p| {
-                p.recordError();
-            }
-        };
-    }
+    fn handleConnectionTask(self: *Self, stream: zio.net.Stream) anyerror!void {
+        _ = self.active_requests.fetchAdd(1, .monotonic);
+        defer _ = self.active_requests.fetchSub(1, .monotonic);
 
-    /// Handles a single connection.
-    fn handleConnection(self: *Self, socket: Socket) !void {
-        var sock = socket;
+        var conn_stream = stream;
+        var should_close_stream = true;
+        defer {
+            if (should_close_stream) {
+                conn_stream.close();
+            }
+        }
 
         var buffer: [8192]u8 = undefined;
         var parser = Parser.init(self.allocator);
         defer parser.deinit();
 
-        while (!parser.isComplete()) {
-            const n = try sock.recv(&buffer);
-            if (n == 0) {
-                sock.close();
-                return;
-            }
-            _ = try parser.feed(buffer[0..n]);
-        }
+        while (self.running.load(.acquire)) {
+            parser.reset();
 
-        var req = try Request.init(
-            self.allocator,
-            parser.method orelse .GET,
-            parser.path orelse "/",
-        );
-        defer req.deinit();
+            while (!parser.isComplete()) {
+                const n = conn_stream.read(&buffer, .none) catch |err| {
+                    _ = self.total_errors.fetchAdd(1, .monotonic);
+                    return err;
+                };
 
-        for (parser.headers.entries.items) |h| {
-            try req.headers.append(h.name, h.value);
-        }
-
-        if (parser.getBody().len > 0) {
-            req.body = parser.getBody();
-        }
-
-        // Check for WebSocket upgrade
-        if (ws_handler.isUpgradeRequest(&req)) {
-            if (self.ws_handlers.get(req.uri.path)) |ws_h| {
-                // Perform WebSocket upgrade
-                var ws_conn = ws_handler.acceptUpgrade(self.allocator, sock, &req, null) catch |err| {
-                    std.debug.print("WebSocket upgrade failed: {}\n", .{err});
-                    sock.close();
+                if (n == 0) {
                     return;
-                };
-                defer ws_conn.deinit();
+                }
 
-                // Call the WebSocket handler
-                ws_h(&ws_conn) catch |err| {
-                    std.debug.print("WebSocket handler error: {}\n", .{err});
-                };
+                _ = try parser.feed(buffer[0..n]);
+            }
+
+            var req = try Request.init(
+                self.allocator,
+                parser.method orelse .GET,
+                parser.path orelse "/",
+            );
+            defer req.deinit();
+
+            req.version = parser.version;
+
+            for (parser.headers.entries.items) |h| {
+                try req.headers.append(h.name, h.value);
+            }
+
+            if (parser.getBody().len > 0) {
+                req.body = parser.getBody();
+            }
+
+            if (ws_handler.isUpgradeRequest(&req)) {
+                if (self.ws_handlers.get(req.uri.path)) |ws_h| {
+                    var ws_conn = ws_handler.acceptUpgradeStream(self.allocator, conn_stream, &req, null) catch |err| {
+                        _ = self.total_errors.fetchAdd(1, .monotonic);
+                        return err;
+                    };
+                    should_close_stream = false;
+                    defer ws_conn.deinit();
+
+                    ws_h(&ws_conn) catch |err| {
+                        std.debug.print("WebSocket handler error: {}\n", .{err});
+                        _ = self.total_errors.fetchAdd(1, .monotonic);
+                    };
+                    return;
+                }
+
+                try self.sendErrorStream(conn_stream, 404);
                 return;
             }
-        }
 
-        // Regular HTTP handling
-        defer sock.close();
+            var ctx = Context.init(self.allocator, &req);
+            defer ctx.deinit();
 
-        var ctx = Context.init(self.allocator, &req);
-        defer ctx.deinit();
+            const route_result = self.router.find(req.method, req.uri.path);
 
-        const route_result = self.router.find(req.method, req.uri.path);
+            if (route_result == null) {
+                try self.sendErrorStream(conn_stream, 404);
+                if (!self.shouldKeepAlive(&req)) return;
+                continue;
+            }
 
-        if (route_result) |r| {
-            for (r.params) |p| {
+            const matched_route = route_result.?;
+            for (matched_route.params) |p| {
                 try ctx.params.put(p.name, p.value);
             }
-        }
 
-        var response = if (route_result) |r|
-            r.handler(&ctx) catch |err| {
+            var response = matched_route.handler(&ctx) catch |err| {
                 std.debug.print("Handler error: {}\n", .{err});
-                return self.sendError(&sock, 500);
+                _ = self.total_errors.fetchAdd(1, .monotonic);
+                try self.sendErrorStream(conn_stream, 500);
+                if (!self.shouldKeepAlive(&req)) return;
+                continue;
+            };
+
+            defer response.deinit();
+
+            const formatted = try http.formatResponse(&response, self.allocator);
+            defer self.allocator.free(formatted);
+
+            try conn_stream.writeAll(formatted, .none);
+            _ = self.requests_handled.fetchAdd(1, .monotonic);
+
+            if (!self.shouldKeepAlive(&req)) {
+                return;
             }
-        else
-            return self.sendError(&sock, 404);
-
-        defer response.deinit();
-
-        const formatted = try http.formatResponse(&response, self.allocator);
-        defer self.allocator.free(formatted);
-
-        try sock.sendAll(formatted);
+        }
     }
 
-    /// Sends an error response.
-    fn sendError(self: *Self, socket: *Socket, code: u16) !void {
+    fn sendErrorStream(self: *Self, stream: zio.net.Stream, code: u16) !void {
         var resp = Response.init(self.allocator, code);
         defer resp.deinit();
 
         const formatted = try http.formatResponse(&resp, self.allocator);
         defer self.allocator.free(formatted);
 
-        try socket.sendAll(formatted);
+        try stream.writeAll(formatted, .none);
+    }
+
+    fn shouldKeepAlive(self: *const Self, req: *const Request) bool {
+        if (!self.config.keep_alive) return false;
+
+        if (req.headers.get(HeaderName.CONNECTION)) |connection| {
+            if (std.ascii.eqlIgnoreCase(connection, "close")) return false;
+            if (std.ascii.eqlIgnoreCase(connection, "keep-alive")) return true;
+        }
+
+        return req.version == .HTTP_1_1;
+    }
+
+    fn resolveExecutorCount(self: *const Self) u6 {
+        var count: u32 = self.config.threads;
+
+        if (count == 0) {
+            if (self.threading_enabled) {
+                count = @intCast(std.Thread.getCpuCount() catch 1);
+            } else {
+                count = 1;
+            }
+        }
+
+        count = @max(@as(u32, 1), count);
+        count = @min(@as(u32, 63), count);
+        return @intCast(count);
     }
 };
+
+const ListenThreadContext = struct {
+    server: *Server,
+    err: ?anyerror = null,
+};
+
+const ClientThreadContext = struct {
+    port: u16,
+    err: ?anyerror = null,
+    ok: bool = false,
+};
+
+fn runServerInThread(ctx: *ListenThreadContext) void {
+    ctx.server.listen() catch |err| {
+        ctx.err = err;
+    };
+}
+
+fn runConcurrentClient(ctx: *ClientThreadContext) void {
+    const addr = std.net.Address.parseIp("127.0.0.1", ctx.port) catch |err| {
+        ctx.err = err;
+        return;
+    };
+
+    var socket = socket_mod.Socket.createForAddress(addr) catch |err| {
+        ctx.err = err;
+        return;
+    };
+    defer socket.close();
+
+    socket.setRecvTimeout(2000) catch {};
+    socket.setSendTimeout(2000) catch {};
+
+    socket.connect(addr) catch |err| {
+        ctx.err = err;
+        return;
+    };
+
+    socket.sendAll(
+        "GET /concurrent HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
+    ) catch |err| {
+        ctx.err = err;
+        return;
+    };
+
+    var buffer: [2048]u8 = undefined;
+    const n = socket.recv(&buffer) catch |err| {
+        ctx.err = err;
+        return;
+    };
+
+    if (n == 0) {
+        ctx.err = error.UnexpectedEof;
+        return;
+    }
+
+    if (std.mem.indexOf(u8, buffer[0..n], "HTTP/1.1 200 OK") == null) {
+        ctx.err = error.BadHttpResponse;
+        return;
+    }
+
+    ctx.ok = true;
+}
+
+fn reserveTestPort() !u16 {
+    var listener = try socket_mod.TcpListener.init(try std.net.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const addr = try listener.getLocalAddress();
+    return addr.getPort();
+}
+
+fn waitForServerReady(port: u16, timeout_ms: u64) !void {
+    const addr = try std.net.Address.parseIp("127.0.0.1", port);
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+
+    while (std.time.milliTimestamp() < deadline) {
+        var probe = socket_mod.Socket.createForAddress(addr) catch {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+            continue;
+        };
+        defer probe.close();
+
+        probe.setRecvTimeout(50) catch {};
+        probe.setSendTimeout(50) catch {};
+
+        if (probe.connect(addr)) {
+            return;
+        } else |_| {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+            continue;
+        }
+    }
+
+    return error.ServerStartTimeout;
+}
+
+fn parseContentLength(headers: []const u8) ?usize {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " ");
+        if (!std.ascii.eqlIgnoreCase(name, "Content-Length")) continue;
+
+        const value = std.mem.trim(u8, line[colon + 1 ..], " ");
+        return std.fmt.parseUnsigned(usize, value, 10) catch null;
+    }
+    return null;
+}
+
+fn readHttpResponse(allocator: Allocator, socket: *socket_mod.Socket) ![]u8 {
+    var response = std.ArrayListUnmanaged(u8){};
+    errdefer response.deinit(allocator);
+
+    while (true) {
+        if (std.mem.indexOf(u8, response.items, "\r\n\r\n")) |headers_end| {
+            const header_len = headers_end + 4;
+            const content_len = parseContentLength(response.items[0..header_len]) orelse 0;
+            const total_len = header_len + content_len;
+
+            if (response.items.len >= total_len) {
+                const out = try allocator.alloc(u8, total_len);
+                @memcpy(out, response.items[0..total_len]);
+                response.deinit(allocator);
+                return out;
+            }
+        }
+
+        var buf: [1024]u8 = undefined;
+        const n = try socket.recv(&buf);
+        if (n == 0) return error.UnexpectedEof;
+        try response.appendSlice(allocator, buf[0..n]);
+    }
+}
 
 test "Server initialization" {
     const allocator = std.testing.allocator;
@@ -493,4 +669,302 @@ test "Server with config" {
 
     try std.testing.expectEqual(@as(u16, 3000), server.config.port);
     try std.testing.expectEqualStrings("0.0.0.0", server.config.host);
+}
+
+test "Server threading config updates executor count" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(u6, 1), server.resolveExecutorCount());
+
+    server.enableThreading(.{ .num_workers = 4 });
+    try std.testing.expect(server.isThreadingEnabled());
+    try std.testing.expectEqual(@as(u6, 4), server.resolveExecutorCount());
+
+    server.disableThreading();
+    try std.testing.expect(!server.isThreadingEnabled());
+    try std.testing.expectEqual(@as(u6, 1), server.resolveExecutorCount());
+}
+
+test "Server resolveExecutorCount clamps upper bound" {
+    const allocator = std.testing.allocator;
+    var server = Server.initWithConfig(allocator, .{ .threads = 1000 });
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(u6, 63), server.resolveExecutorCount());
+}
+
+test "Server shouldKeepAlive honors version and connection header" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    var req = try Request.init(allocator, .GET, "/");
+    defer req.deinit();
+
+    req.version = .HTTP_1_1;
+    try std.testing.expect(server.shouldKeepAlive(&req));
+
+    try req.headers.set(HeaderName.CONNECTION, "close");
+    try std.testing.expect(!server.shouldKeepAlive(&req));
+
+    _ = req.headers.remove(HeaderName.CONNECTION);
+    req.version = .HTTP_1_0;
+    try std.testing.expect(!server.shouldKeepAlive(&req));
+
+    try req.headers.set(HeaderName.CONNECTION, "keep-alive");
+    try std.testing.expect(server.shouldKeepAlive(&req));
+}
+
+test "Server getStats returns snapshot" {
+    const allocator = std.testing.allocator;
+    var server = Server.initWithConfig(allocator, .{ .threads = 6 });
+    defer server.deinit();
+
+    _ = server.requests_handled.fetchAdd(10, .monotonic);
+    _ = server.active_requests.fetchAdd(3, .monotonic);
+    _ = server.total_errors.fetchAdd(2, .monotonic);
+
+    const stats = server.getStats();
+    try std.testing.expectEqual(@as(u64, 10), stats.requests_handled);
+    try std.testing.expectEqual(@as(u64, 3), stats.active_requests);
+    try std.testing.expectEqual(@as(u64, 2), stats.total_errors);
+    try std.testing.expectEqual(@as(u32, 6), stats.executors);
+}
+
+test "Server handles keep-alive requests on same connection" {
+    const allocator = std.testing.allocator;
+    const port = try reserveTestPort();
+
+    var server = Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+    });
+    defer server.deinit();
+
+    try server.get("/ka", struct {
+        fn handler(ctx: *Context) anyerror!Response {
+            return ctx.text("keepalive-ok");
+        }
+    }.handler);
+
+    var listen_ctx = ListenThreadContext{ .server = &server };
+    var listen_thread = try std.Thread.spawn(.{}, runServerInThread, .{&listen_ctx});
+    var joined = false;
+    defer {
+        server.stop();
+        if (!joined) {
+            listen_thread.join();
+        }
+    }
+
+    try waitForServerReady(port, 2000);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", port);
+    var client = try socket_mod.Socket.createForAddress(addr);
+    defer client.close();
+
+    try client.setRecvTimeout(2000);
+    try client.setSendTimeout(2000);
+    try client.connect(addr);
+
+    try client.sendAll(
+        "GET /ka HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Connection: keep-alive\r\n" ++
+            "\r\n",
+    );
+
+    const resp1 = try readHttpResponse(allocator, &client);
+    defer allocator.free(resp1);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp1, "HTTP/1.1 200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp1, "keepalive-ok") != null);
+
+    try client.sendAll(
+        "GET /ka HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
+    );
+
+    const resp2 = try readHttpResponse(allocator, &client);
+    defer allocator.free(resp2);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "HTTP/1.1 200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "keepalive-ok") != null);
+
+    server.stop();
+    listen_thread.join();
+    joined = true;
+
+    if (listen_ctx.err) |err| {
+        return err;
+    }
+
+    const stats = server.getStats();
+    try std.testing.expectEqual(@as(u64, 2), stats.requests_handled);
+    try std.testing.expectEqual(@as(u64, 0), stats.total_errors);
+}
+
+test "Server websocket upgrade and echo on zio stream" {
+    const allocator = std.testing.allocator;
+    const port = try reserveTestPort();
+
+    var server = Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+    });
+    defer server.deinit();
+
+    try server.ws("/ws", struct {
+        fn handler(conn: *ws_handler.WebSocketConnection) anyerror!void {
+            const msg = try conn.receive();
+            defer conn.allocator.free(msg.payload);
+            try conn.send(msg.payload, msg.opcode);
+        }
+    }.handler);
+
+    var listen_ctx = ListenThreadContext{ .server = &server };
+    var listen_thread = try std.Thread.spawn(.{}, runServerInThread, .{&listen_ctx});
+    var joined = false;
+    defer {
+        server.stop();
+        if (!joined) {
+            listen_thread.join();
+        }
+    }
+
+    try waitForServerReady(port, 2000);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", port);
+    var client = try socket_mod.Socket.createForAddress(addr);
+    defer client.close();
+
+    try client.setRecvTimeout(2000);
+    try client.setSendTimeout(2000);
+    try client.connect(addr);
+
+    const ws_key = "dGhlIHNhbXBsZSBub25jZQ==";
+    try client.sendAll(
+        "GET /ws HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: " ++ ws_key ++ "\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "\r\n",
+    );
+
+    const handshake = try readHttpResponse(allocator, &client);
+    defer allocator.free(handshake);
+
+    try std.testing.expect(std.mem.indexOf(u8, handshake, "HTTP/1.1 101 Switching Protocols") != null);
+
+    const accept = websocket.computeAccept(ws_key);
+    var accept_line_buf: [128]u8 = undefined;
+    const accept_line = try std.fmt.bufPrint(&accept_line_buf, "Sec-WebSocket-Accept: {s}\r\n", .{&accept});
+    try std.testing.expect(std.mem.indexOf(u8, handshake, accept_line) != null);
+
+    const encoded = try websocket.encodeFrame(allocator, .{
+        .opcode = .text,
+        .mask = .{ 0x01, 0x02, 0x03, 0x04 },
+        .payload = "zio-echo",
+    }, true);
+    defer allocator.free(encoded);
+
+    try client.sendAll(encoded);
+
+    var frame_bytes = std.ArrayListUnmanaged(u8){};
+    defer frame_bytes.deinit(allocator);
+
+    var decoded: ?websocket.DecodeResult = null;
+    while (decoded == null) {
+        var chunk: [256]u8 = undefined;
+        const n = try client.recv(&chunk);
+        if (n == 0) return error.UnexpectedEof;
+
+        try frame_bytes.appendSlice(allocator, chunk[0..n]);
+        decoded = try websocket.decodeFrame(allocator, frame_bytes.items, websocket.DEFAULT_MAX_PAYLOAD_SIZE);
+    }
+
+    const echo = decoded.?;
+    defer allocator.free(echo.payload_owned);
+
+    try std.testing.expectEqual(websocket.Opcode.text, echo.frame.opcode);
+    try std.testing.expectEqualStrings("zio-echo", echo.frame.payload);
+
+    server.stop();
+    listen_thread.join();
+    joined = true;
+
+    if (listen_ctx.err) |err| {
+        return err;
+    }
+
+    const stats = server.getStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.total_errors);
+}
+
+test "Server handles concurrent requests and updates stats" {
+    const allocator = std.testing.allocator;
+    const port = try reserveTestPort();
+
+    var server = Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+    });
+    defer server.deinit();
+
+    server.enableThreading(.{ .num_workers = 4 });
+
+    try server.get("/concurrent", struct {
+        fn handler(ctx: *Context) anyerror!Response {
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+            return ctx.text("ok");
+        }
+    }.handler);
+
+    var listen_ctx = ListenThreadContext{ .server = &server };
+    var listen_thread = try std.Thread.spawn(.{}, runServerInThread, .{&listen_ctx});
+    var joined = false;
+    defer {
+        server.stop();
+        if (!joined) {
+            listen_thread.join();
+        }
+    }
+
+    try waitForServerReady(port, 2000);
+
+    const client_count = 12;
+    var client_ctxs: [client_count]ClientThreadContext = undefined;
+    var client_threads: [client_count]std.Thread = undefined;
+
+    for (0..client_count) |i| {
+        client_ctxs[i] = .{ .port = port };
+        client_threads[i] = try std.Thread.spawn(.{}, runConcurrentClient, .{&client_ctxs[i]});
+    }
+
+    for (client_threads) |thread| {
+        thread.join();
+    }
+
+    server.stop();
+    listen_thread.join();
+    joined = true;
+
+    if (listen_ctx.err) |err| {
+        return err;
+    }
+
+    for (client_ctxs) |ctx| {
+        if (ctx.err) |err| return err;
+        try std.testing.expect(ctx.ok);
+    }
+
+    const stats = server.getStats();
+    try std.testing.expect(stats.requests_handled >= client_count);
+    try std.testing.expectEqual(@as(u64, 0), stats.total_errors);
 }

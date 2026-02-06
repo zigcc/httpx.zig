@@ -83,14 +83,13 @@ zig build docs
 
 ### Windows
 - Requires linking `ws2_32` and `mswsock` system libraries
-- Uses IOCP for async I/O (in io/poller.zig)
+- Async I/O is provided by ZIO runtime backend
 
 ### Linux
-- Uses epoll for async I/O
-- Supports io_uring (if available)
+- Async I/O is provided by ZIO runtime backend
 
 ### macOS
-- Uses kqueue for async I/O
+- Async I/O is provided by ZIO runtime backend
 
 this library is not for http client, just for http server
 
@@ -176,4 +175,3 @@ Before submitting changes:
 5. **Comptime vs runtime**: Be aware of when values are known at compile time
 
 6. **Cross-platform differences**: Test on multiple platforms or use abstraction layers
-

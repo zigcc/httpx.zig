@@ -319,7 +319,7 @@ pub const Socket = struct {
     }
 
     /// Sets the socket to non-blocking mode.
-    /// This is required for use with event pollers (epoll/kqueue/IOCP).
+    /// Useful when integrating with async runtimes.
     pub fn setNonBlocking(self: *Self, enable: bool) !void {
         if (is_windows) {
             // Windows: use ioctlsocket with FIONBIO
@@ -588,7 +588,7 @@ pub const UdpSocket = struct {
     }
 
     /// Sets the socket to non-blocking mode.
-    /// This is required for use with event pollers (epoll/kqueue/IOCP).
+    /// Useful when integrating with async runtimes.
     pub fn setNonBlocking(self: *Self, enable: bool) !void {
         if (is_windows) {
             const ws2_32 = std.os.windows.ws2_32;

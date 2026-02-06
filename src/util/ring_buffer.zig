@@ -1,7 +1,7 @@
 //! Lock-Free Ring Buffer for httpx.zig
 //!
 //! A fixed-capacity circular buffer providing O(1) push/pop operations.
-//! Used for high-performance task queues in worker pools.
+//! Used in internal queues and buffering paths.
 //!
 //! ## Features
 //! - O(1) push and pop operations

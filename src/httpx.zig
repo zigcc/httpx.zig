@@ -54,14 +54,6 @@ pub const websocket = @import("protocol/websocket.zig");
 pub const socket = @import("net/socket.zig");
 pub const address = @import("net/address.zig");
 
-// I/O subsystem
-pub const io = struct {
-    pub const poller = @import("io/poller.zig");
-    pub const Poller = poller.Poller;
-    pub const Event = poller.Event;
-    pub const EventMask = poller.EventMask;
-};
-
 // TLS
 pub const tls = @import("tls/tls.zig");
 pub const tls_session_pool = @import("tls/session_pool.zig");
@@ -71,8 +63,6 @@ pub const server_mod = @import("server/server.zig");
 pub const router = @import("server/router.zig");
 pub const middleware = @import("server/middleware.zig");
 pub const ws_handler = @import("server/ws_handler.zig");
-pub const worker_pool = @import("server/worker_pool.zig");
-pub const event_server = @import("server/event_server.zig");
 
 // Utilities
 pub const buffer = @import("util/buffer.zig");
@@ -82,6 +72,7 @@ pub const compression_mod = @import("util/compression.zig");
 
 // Concurrency
 pub const executor = @import("concurrency/executor.zig");
+pub const async_runtime = @import("concurrency/async_runtime.zig");
 
 // ============================================================================
 // Type Exports
@@ -177,17 +168,10 @@ pub const isWebSocketUpgrade = ws_handler.isUpgradeRequest;
 // Server
 pub const Server = server_mod.Server;
 pub const ServerConfig = server_mod.ServerConfig;
+pub const ThreadingConfig = server_mod.ThreadingConfig;
+pub const RuntimeStats = server_mod.RuntimeStats;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;
-pub const WorkerPool = server_mod.WorkerPool;
-pub const WorkerPoolConfig = server_mod.WorkerPoolConfig;
-pub const WorkItem = server_mod.WorkItem;
-
-// Event-driven server
-pub const EventServer = event_server.EventServer;
-pub const EventServerConfig = event_server.EventServerConfig;
-pub const EventConnection = event_server.Connection;
-pub const EventConnectionState = event_server.ConnectionState;
 
 // Router
 pub const Router = router.Router;
@@ -252,6 +236,12 @@ pub const decompressAuto = compression_mod.decompressAuto;
 // Executor
 pub const Executor = executor.Executor;
 pub const Task = executor.Task;
+
+// Async runtime backend
+pub const AsyncBackend = async_runtime.Backend;
+pub const selectedAsyncBackend = async_runtime.selected_backend;
+pub const zioEnabled = async_runtime.zio_enabled;
+pub const zio = async_runtime.zio;
 
 // ============================================================================
 // Convenience Functions
@@ -347,16 +337,8 @@ test "address" {
     _ = address;
 }
 
-test "io poller" {
-    _ = io.poller;
-}
-
 test "tls session pool" {
     _ = tls_session_pool;
-}
-
-test "event server" {
-    _ = event_server;
 }
 
 test "cookie" {
@@ -373,4 +355,8 @@ test "multipart" {
 
 test "compression" {
     _ = compression_mod;
+}
+
+test "async runtime" {
+    _ = async_runtime;
 }

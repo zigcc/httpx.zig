@@ -1,9 +1,9 @@
 //! Multi-Threaded Server Example
 //!
-//! Demonstrates using the worker pool for concurrent request handling.
+//! Demonstrates using multiple ZIO executors for concurrent request handling.
 //!
 //! This server can handle multiple requests simultaneously by dispatching
-//! them to a pool of worker threads.
+//! them across runtime executors.
 //!
 //! Run with: zig build run-threaded_server
 //! Test with: curl http://localhost:8080/ or wrk -t4 -c100 http://localhost:8080/
@@ -25,11 +25,10 @@ pub fn main() !void {
     });
     defer server.deinit();
 
-    // Enable multi-threading with auto-detected worker count
+    // Enable concurrent execution with auto-detected executor count
     // (defaults to number of CPU cores)
     server.enableThreading(.{
         .num_workers = 0, // 0 = auto-detect CPU cores
-        .max_queue_size = 1024,
     });
 
     std.debug.print("Threading enabled: {}\n", .{server.isThreadingEnabled()});
@@ -44,7 +43,7 @@ pub fn main() !void {
     std.debug.print("\nRoutes:\n", .{});
     std.debug.print("  GET  /       - Hello World\n", .{});
     std.debug.print("  GET  /slow   - Simulated slow response (100ms)\n", .{});
-    std.debug.print("  GET  /stats  - Worker pool statistics\n", .{});
+    std.debug.print("  GET  /stats  - Runtime statistics\n", .{});
     std.debug.print("  GET  /health - Health check\n", .{});
     std.debug.print("  POST /echo   - Echo request body\n", .{});
     std.debug.print("\n", .{});
@@ -66,9 +65,7 @@ fn handleSlow(ctx: *httpx.Context) !httpx.Response {
 }
 
 fn handleStats(ctx: *httpx.Context) !httpx.Response {
-    // Note: We can't easily access the server's stats from the handler
-    // In a real app, you'd use a different mechanism to expose metrics
-    return ctx.text("Worker pool statistics: Use server.getWorkerStats() from the main thread");
+    return ctx.text("Runtime statistics: query from main thread via server.getStats()");
 }
 
 fn handleHealth(ctx: *httpx.Context) !httpx.Response {

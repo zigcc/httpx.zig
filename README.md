@@ -40,6 +40,13 @@ const httpx_module = httpx_dep.module("httpx");
 exe.addModule("httpx", httpx_module);
 ```
 
+`httpx.zig` now uses ZIO as its async backend by default.
+You can inspect this via `httpx.selectedAsyncBackend` and `httpx.zioEnabled`,
+and access ZIO APIs directly from `httpx.zio`.
+
+Legacy event-loop modules are removed; use `httpx.Server` with
+`server.enableThreading(.{ .num_workers = ... })` for concurrency tuning.
+
 ## Quick Start
 
 Here is a simple example of creating an HTTP server:

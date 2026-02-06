@@ -27,6 +27,7 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const zio = @import("zio");
 
 const ws = @import("../protocol/websocket.zig");
 const HttpError = @import("../core/types.zig").HttpError;
@@ -50,7 +51,7 @@ pub const ConnectionState = enum {
 /// Represents an active WebSocket connection from a client.
 pub const WebSocketConnection = struct {
     allocator: Allocator,
-    socket: Socket,
+    transport: Transport,
     state: ConnectionState,
     frame_reader: ws.FrameReader,
 
@@ -67,11 +68,26 @@ pub const WebSocketConnection = struct {
     /// Messages larger than this will require heap allocation.
     const SEND_BUFFER_SIZE = 4096;
 
+    const Transport = union(enum) {
+        socket: Socket,
+        stream: zio.net.Stream,
+    };
+
     /// Creates a new WebSocket connection from an accepted socket.
     pub fn init(allocator: Allocator, socket: Socket) Self {
         return .{
             .allocator = allocator,
-            .socket = socket,
+            .transport = .{ .socket = socket },
+            .state = .open,
+            .frame_reader = ws.FrameReader.init(allocator),
+        };
+    }
+
+    /// Creates a new WebSocket connection from an accepted ZIO stream.
+    pub fn initStream(allocator: Allocator, stream: zio.net.Stream) Self {
+        return .{
+            .allocator = allocator,
+            .transport = .{ .stream = stream },
             .state = .open,
             .frame_reader = ws.FrameReader.init(allocator),
         };
@@ -80,7 +96,11 @@ pub const WebSocketConnection = struct {
     /// Releases connection resources.
     pub fn deinit(self: *Self) void {
         self.frame_reader.deinit();
-        self.socket.close();
+
+        switch (self.transport) {
+            .socket => |*sock| sock.close(),
+            .stream => |stream| stream.close(),
+        }
     }
 
     /// Sends a text message.
@@ -113,12 +133,12 @@ pub const WebSocketConnection = struct {
         if (encoded_size <= SEND_BUFFER_SIZE) {
             var stack_buf: [SEND_BUFFER_SIZE]u8 = undefined;
             const n = try ws.encodeFrameInto(&stack_buf, frame, false);
-            try self.socket.sendAll(stack_buf[0..n]);
+            try self.writeAll(stack_buf[0..n]);
         } else {
             // Fall back to heap allocation for large messages
             const encoded = try ws.encodeFrame(self.allocator, frame, false);
             defer self.allocator.free(encoded);
-            try self.socket.sendAll(encoded);
+            try self.writeAll(encoded);
         }
     }
 
@@ -198,7 +218,7 @@ pub const WebSocketConnection = struct {
 
             // Need more data from socket
             var buf: [8192]u8 = undefined;
-            const n = self.socket.recv(&buf) catch |err| {
+            const n = self.read(&buf) catch |err| {
                 self.state = .closed;
                 return err;
             };
@@ -210,6 +230,20 @@ pub const WebSocketConnection = struct {
 
             try self.frame_reader.feed(buf[0..n]);
         }
+    }
+
+    fn writeAll(self: *Self, data: []const u8) !void {
+        switch (self.transport) {
+            .socket => |*sock| try sock.sendAll(data),
+            .stream => |stream| try stream.writeAll(data, .none),
+        }
+    }
+
+    fn read(self: *Self, buffer: []u8) !usize {
+        return switch (self.transport) {
+            .socket => |*sock| sock.recv(buffer),
+            .stream => |stream| stream.read(buffer, .none),
+        };
     }
 
     /// Returns true if the connection is open.
@@ -313,6 +347,24 @@ pub fn acceptUpgrade(
     try sock.sendAll(response);
 
     return WebSocketConnection.init(allocator, socket);
+}
+
+/// Performs the server-side WebSocket handshake over a ZIO stream.
+pub fn acceptUpgradeStream(
+    allocator: Allocator,
+    stream: zio.net.Stream,
+    request: *const Request,
+    protocol: ?[]const u8,
+) !WebSocketConnection {
+    if (!isUpgradeRequest(request)) {
+        return error.NotWebSocketRequest;
+    }
+
+    const response = try generateUpgradeResponse(allocator, request, protocol);
+    defer allocator.free(response);
+
+    try stream.writeAll(response, .none);
+    return WebSocketConnection.initStream(allocator, stream);
 }
 
 /// Case-insensitive ASCII string comparison.

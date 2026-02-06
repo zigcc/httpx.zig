@@ -6,13 +6,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const httpx_module = b.createModule(.{
+    const httpx_module = b.addModule("httpx", .{
         .root_source_file = b.path("src/httpx.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-
-    _ = b.addModule("httpx", .{
-        .root_source_file = b.path("src/httpx.zig"),
-    });
+    configureHttpxModule(b, httpx_module, target, optimize);
 
     const examples = [_]struct { name: []const u8, path: []const u8, skip_run_all: bool = false }{
         .{ .name = "post_json", .path = "examples/post_json.zig" },
@@ -89,13 +88,13 @@ pub fn build(b: *std.Build) void {
         run_all_examples.dependOn(last);
     }
 
-    const tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/httpx.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const tests_module = b.createModule(.{
+        .root_source_file = b.path("src/httpx.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    configureHttpxModule(b, tests_module, target, optimize);
+    const tests = b.addTest(.{ .root_module = tests_module });
 
     if (target.result.os.tag == .windows) {
         tests.linkSystemLibrary("ws2_32");
@@ -147,14 +146,17 @@ pub fn build(b: *std.Build) void {
 
     for (cross_targets) |t| {
         const target_cross = b.resolveTargetQuery(t);
+        const lib_cross_module = b.createModule(.{
+            .root_source_file = b.path("src/httpx.zig"),
+            .target = target_cross,
+            .optimize = optimize,
+        });
+        configureHttpxModule(b, lib_cross_module, target_cross, optimize);
+
         const lib_cross = b.addLibrary(.{
             .name = "httpx",
             .linkage = .static,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/httpx.zig"),
-                .target = target_cross,
-                .optimize = optimize,
-            }),
+            .root_module = lib_cross_module,
         });
 
         if (t.os_tag == .windows) {
@@ -166,14 +168,17 @@ pub fn build(b: *std.Build) void {
         build_all_step.dependOn(&lib_cross.step);
     }
 
+    const lib_module = b.createModule(.{
+        .root_source_file = b.path("src/httpx.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    configureHttpxModule(b, lib_module, target, optimize);
+
     const lib = b.addLibrary(.{
         .name = "httpx",
         .linkage = .static,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/httpx.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = lib_module,
     });
 
     if (target.result.os.tag == .windows) {
@@ -190,4 +195,17 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "docs",
     });
     docs_step.dependOn(&install_docs.step);
+}
+
+fn configureHttpxModule(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("zio", zio_dep.module("zio"));
 }

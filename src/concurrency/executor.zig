@@ -1,17 +1,13 @@
-//! Task Executor for httpx.zig
-//!
-//! Provides async task execution capabilities:
-//!
-//! - Thread pool for parallel execution
-//! - Task queuing and scheduling
-//! - Cross-platform thread management
+//! Task Executor for httpx.zig (ZIO-backed).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
+const zio = @import("zio");
 
 pub const ExecutorError = error{
     TaskQueueFull,
+    ExecutorNotRunning,
 };
 
 /// Task function type.
@@ -31,24 +27,21 @@ pub const ExecutorConfig = struct {
     idle_timeout_ms: u64 = 60_000,
 };
 
-/// Thread pool executor for parallel task execution.
+/// ZIO-backed executor.
 pub const Executor = struct {
     allocator: Allocator,
     config: ExecutorConfig,
     tasks: std.ArrayListUnmanaged(Task) = .empty,
+    runtime: ?*zio.Runtime = null,
     running: bool = false,
-    threads: []Thread = &.{},
     mutex: Thread.Mutex = .{},
-    cond: Thread.Condition = .{},
 
     const Self = @This();
 
-    /// Creates an executor with default configuration.
     pub fn init(allocator: Allocator) Self {
         return initWithConfig(allocator, .{});
     }
 
-    /// Creates an executor with custom configuration.
     pub fn initWithConfig(allocator: Allocator, config: ExecutorConfig) Self {
         var cfg = config;
         if (cfg.num_threads == 0) {
@@ -61,63 +54,61 @@ pub const Executor = struct {
         };
     }
 
-    /// Releases executor resources.
     pub fn deinit(self: *Self) void {
         self.stop();
         self.tasks.deinit(self.allocator);
-        if (self.threads.len > 0) {
-            self.allocator.free(self.threads);
-        }
     }
 
-    /// Submits a task for execution.
     pub fn submit(self: *Self, task: Task) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        if (self.running and self.runtime != null) {
+            try self.dispatch(task);
+            return;
+        }
 
         if (self.tasks.items.len >= self.config.task_queue_size) {
             return ExecutorError.TaskQueueFull;
         }
 
         try self.tasks.append(self.allocator, task);
-        self.cond.signal();
     }
 
-    /// Submits a function for execution.
     pub fn execute(self: *Self, func: TaskFn, context: ?*anyopaque) !void {
         try self.submit(.{ .func = func, .context = context });
     }
 
-    /// Starts the executor threads.
     pub fn start(self: *Self) !void {
         if (self.running) return;
+
+        const executors: u6 = @intCast(@min(@as(u32, 63), @max(@as(u32, 1), self.config.num_threads)));
+        self.runtime = try zio.Runtime.init(self.allocator, .{ .executors = .exact(executors) });
         self.running = true;
 
-        self.threads = try self.allocator.alloc(Thread, self.config.num_threads);
-
-        for (self.threads) |*thread| {
-            thread.* = try Thread.spawn(.{}, workerLoop, .{self});
+        // Drain queued tasks now that runtime is available.
+        while (self.tasks.items.len > 0) {
+            const idx = self.tasks.items.len - 1;
+            const task = self.tasks.items[idx];
+            self.tasks.items.len = idx;
+            try self.dispatch(task);
         }
     }
 
-    /// Stops all executor threads.
     pub fn stop(self: *Self) void {
         if (!self.running) return;
-        self.mutex.lock();
         self.running = false;
-        self.cond.broadcast();
-        self.mutex.unlock();
 
-        for (self.threads) |thread| thread.join();
+        if (self.runtime) |rt| {
+            rt.deinit();
+            self.runtime = null;
+        }
     }
 
-    /// Returns the number of pending tasks.
     pub fn pendingCount(self: *const Self) usize {
-        // best-effort snapshot
         return self.tasks.items.len;
     }
 
-    /// Runs all tasks synchronously.
     pub fn runAll(self: *Self) void {
         while (true) {
             self.mutex.lock();
@@ -134,29 +125,18 @@ pub const Executor = struct {
         }
     }
 
-    fn workerLoop(self: *Self) void {
-        while (true) {
-            self.mutex.lock();
-            while (self.running and self.tasks.items.len == 0) {
-                self.cond.wait(&self.mutex);
-            }
-            if (!self.running) {
-                self.mutex.unlock();
-                break;
-            }
+    fn dispatch(self: *Self, task: Task) !void {
+        const rt = self.runtime orelse return ExecutorError.ExecutorNotRunning;
+        var handle = try rt.spawnBlocking(runTask, .{ task.func, task.context });
+        handle.join();
+    }
 
-            const idx = self.tasks.items.len - 1;
-            const task = self.tasks.items[idx];
-            self.tasks.items.len = idx;
-            self.mutex.unlock();
-
-            task.func(task.context);
-        }
+    fn runTask(func: TaskFn, context: ?*anyopaque) void {
+        func(context);
     }
 };
 
 /// Future representing a pending result.
-/// Uses condition variable for efficient waiting instead of busy-polling.
 pub fn Future(comptime T: type) type {
     return struct {
         result: ?T = null,
@@ -167,8 +147,6 @@ pub fn Future(comptime T: type) type {
 
         const Self = @This();
 
-        /// Waits for the future to complete (blocking).
-        /// Uses condition variable - no busy waiting.
         pub fn wait(self: *Self) !T {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -183,8 +161,6 @@ pub fn Future(comptime T: type) type {
             return self.result.?;
         }
 
-        /// Waits for the future with a timeout.
-        /// Returns null if timeout expires before completion.
         pub fn waitTimeout(self: *Self, timeout_ns: u64) !?T {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -194,7 +170,7 @@ pub fn Future(comptime T: type) type {
             }
 
             if (!self.completed.load(.acquire)) {
-                return null; // Timeout
+                return null;
             }
 
             if (self.error_val) |err| {
@@ -203,7 +179,6 @@ pub fn Future(comptime T: type) type {
             return self.result.?;
         }
 
-        /// Returns the result if available (non-blocking).
         pub fn get(self: *Self) ?T {
             if (self.completed.load(.acquire) and self.error_val == null) {
                 return self.result;
@@ -211,13 +186,10 @@ pub fn Future(comptime T: type) type {
             return null;
         }
 
-        /// Returns true if the future is completed.
         pub fn isDone(self: *const Self) bool {
             return self.completed.load(.acquire);
         }
 
-        /// Completes the future with a result.
-        /// Wakes up any waiting threads.
         pub fn complete(self: *Self, value: T) void {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -227,8 +199,6 @@ pub fn Future(comptime T: type) type {
             self.cond.broadcast();
         }
 
-        /// Completes the future with an error.
-        /// Wakes up any waiting threads.
         pub fn completeWithError(self: *Self, err: anyerror) void {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -273,7 +243,6 @@ test "Future" {
     try std.testing.expect(!future.isDone());
     try std.testing.expect(future.get() == null);
 
-    // Use new complete() method instead of direct field assignment
     future.complete(42);
 
     try std.testing.expect(future.isDone());
@@ -283,7 +252,6 @@ test "Future" {
 test "Future wait with thread" {
     var future = Future(i32){};
 
-    // Spawn a thread that completes the future after a short delay
     const worker = try Thread.spawn(.{}, struct {
         fn run(f: *Future(i32)) void {
             Thread.sleep(10 * std.time.ns_per_ms);
@@ -291,7 +259,6 @@ test "Future wait with thread" {
         }
     }.run, .{&future});
 
-    // Wait should block until complete (no busy polling)
     const result = try future.wait();
     try std.testing.expectEqual(@as(i32, 123), result);
 
@@ -301,11 +268,9 @@ test "Future wait with thread" {
 test "Future waitTimeout" {
     var future = Future(i32){};
 
-    // Should timeout and return null
     const result = try future.waitTimeout(10 * std.time.ns_per_ms);
     try std.testing.expect(result == null);
 
-    // Now complete and try again
     future.complete(456);
     const result2 = try future.waitTimeout(10 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(i32, 456), result2.?);
