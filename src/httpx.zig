@@ -177,10 +177,13 @@ pub const Handler = server_mod.Handler;
 pub const Router = router.Router;
 pub const RouteGroup = router.RouteGroup;
 pub const RouteMatch = router.RouteMatch;
+pub const FindResult = router.FindResult;
+pub const RouteParam = router.RouteParam;
 
 // Middleware
 pub const Middleware = middleware.Middleware;
 pub const Next = middleware.Next;
+pub const MiddlewareChain = middleware.MiddlewareChain;
 pub const cors = middleware.cors;
 pub const logger = middleware.logger;
 pub const compression = middleware.compression;
@@ -189,6 +192,8 @@ pub const CompressionConfig = middleware.CompressionConfig;
 pub const rateLimit = middleware.rateLimit;
 pub const basicAuth = middleware.basicAuth;
 pub const helmet = middleware.helmet;
+pub const recovery = middleware.recovery;
+pub const recoveryWithWriter = middleware.recoveryWithWriter;
 
 // Buffer utilities
 pub const Buffer = buffer.Buffer;

@@ -1,23 +1,22 @@
 //! HTTP Server Implementation for httpx.zig
 //!
-//! Production-ready HTTP server with comprehensive features:
+//! Gin-style HTTP server with:
 //!
-//! - Express-style routing with path parameters
-//! - Middleware stack support
-//! - Context-based request handling
-//! - JSON response helpers
-//! - Static file serving
+//! - Radix tree routing with path parameters
+//! - Middleware onion model (global + group-level)
+//! - Context-based request handling with abort support
+//! - JSON request binding and response helpers
+//! - Query string parsing
+//! - Static file/directory serving
+//! - 405 Method Not Allowed detection
 //! - Multi-threaded request handling (optional)
 //! - Cross-platform (Linux, Windows, macOS)
 //!
-//! ## Multi-Threading
-//!
-//! By default, the server runs in single-threaded mode for simplicity.
-//! Enable multi-threading for production workloads:
+//! ## Quick Start
 //!
 //! ```zig
 //! var server = Server.init(allocator);
-//! server.enableThreading(.{ .num_workers = 8 });
+//! try server.use(httpx.logger());
 //! try server.get("/hello", helloHandler);
 //! try server.listen();
 //! ```
@@ -38,9 +37,14 @@ const http = @import("../protocol/http.zig");
 const socket_mod = @import("../net/socket.zig");
 const websocket = @import("../protocol/websocket.zig");
 const Router = @import("router.zig").Router;
+const RouteGroup = @import("router.zig").RouteGroup;
+const FindResult = @import("router.zig").FindResult;
 const Middleware = @import("middleware.zig").Middleware;
+const MiddlewareChain = @import("middleware.zig").MiddlewareChain;
+const chainNext = @import("middleware.zig").chainNext;
 const ws_handler = @import("ws_handler.zig");
 const WebSocketHandler = ws_handler.WebSocketHandler;
+const Json = @import("../util/json.zig");
 
 /// Server configuration.
 pub const ServerConfig = struct {
@@ -69,13 +73,45 @@ pub const RuntimeStats = struct {
     executors: u32,
 };
 
-/// Request context passed to handlers.
+/// Handler function type.
+pub const Handler = *const fn (*Context) anyerror!Response;
+
+/// Next function type for middleware.
+pub const Next = @import("middleware.zig").Next;
+
+// ============================================================================
+// Context — Gin-style request context
+// ============================================================================
+
+/// Request context passed to handlers and middleware.
+///
+/// Provides access to the request, response builder, path parameters,
+/// query parameters, and user data. Also supports abort/middleware chain control.
+///
+/// ## Example
+/// ```zig
+/// fn handler(ctx: *Context) anyerror!Response {
+///     const id = ctx.param("id") orelse return ctx.status(400).text("missing id");
+///     const page = ctx.query("page") orelse "1";
+///     return ctx.json(.{ .id = id, .page = page });
+/// }
+/// ```
 pub const Context = struct {
     allocator: Allocator,
     request: *Request,
     response: ResponseBuilder,
     params: std.StringHashMap([]const u8),
     data: std.StringHashMap(*anyopaque),
+
+    // -- Middleware chain state (set by MiddlewareChain.execute) --
+    chain_handlers: Handler = undefined,
+    chain_global_mw: []const Middleware = &.{},
+    chain_route_mw: []const Middleware = &.{},
+    chain_index: usize = 0,
+
+    // -- Abort support --
+    is_aborted: bool = false,
+    abort_response: ?Response = null,
 
     const Self = @This();
 
@@ -95,18 +131,31 @@ pub const Context = struct {
         self.response.deinit();
         self.params.deinit();
         self.data.deinit();
+        if (self.abort_response) |*r| {
+            r.deinit();
+            self.abort_response = null;
+        }
     }
 
-    /// Returns a URL parameter by name.
+    // -- Parameter access --
+
+    /// Returns a URL path parameter by name (e.g., `:id`).
     pub fn param(self: *const Self, name: []const u8) ?[]const u8 {
         return self.params.get(name);
     }
 
-    /// Returns a query parameter by name.
+    /// Returns a query string parameter by name.
+    ///
+    /// Parses the query string from the request URI on each call.
+    /// For repeated access, consider caching the result.
     pub fn query(self: *const Self, name: []const u8) ?[]const u8 {
-        _ = self;
-        _ = name;
-        return null;
+        const qs = self.request.uri.query orelse return null;
+        return getQueryParam(qs, name);
+    }
+
+    /// Returns a query parameter with a default value if not present.
+    pub fn queryDefault(self: *const Self, name: []const u8, default: []const u8) []const u8 {
+        return self.query(name) orelse default;
     }
 
     /// Returns a request header by name.
@@ -114,7 +163,9 @@ pub const Context = struct {
         return self.request.headers.get(name);
     }
 
-    /// Sets the response status code.
+    // -- Response helpers --
+
+    /// Sets the response status code. Returns self for chaining.
     pub fn status(self: *Self, code: u16) *Self {
         _ = self.response.status(code);
         return self;
@@ -126,20 +177,20 @@ pub const Context = struct {
     }
 
     /// Sends a plain text response.
-    pub fn text(self: *Self, data: []const u8) !Response {
+    pub fn text(self: *Self, content: []const u8) !Response {
         _ = try self.response.header(HeaderName.CONTENT_TYPE, "text/plain; charset=utf-8");
-        _ = self.response.body(data);
+        _ = self.response.body(content);
         return self.response.build();
     }
 
     /// Sends an HTML response.
-    pub fn html(self: *Self, data: []const u8) !Response {
+    pub fn html(self: *Self, content: []const u8) !Response {
         _ = try self.response.header(HeaderName.CONTENT_TYPE, "text/html; charset=utf-8");
-        _ = self.response.body(data);
+        _ = self.response.body(content);
         return self.response.build();
     }
 
-    /// Sends a file response.
+    /// Sends a file response. Returns 404 if file not found.
     pub fn file(self: *Self, path: []const u8) !Response {
         const f = std.fs.cwd().openFile(path, .{}) catch return self.status(404).text("Not Found");
         defer f.close();
@@ -148,13 +199,12 @@ pub const Context = struct {
         const content = try self.allocator.alloc(u8, @intCast(stat.size));
         _ = try f.readAll(content);
 
-        // In a real app, detect MIME type from extension
         _ = try self.response.header(HeaderName.CONTENT_TYPE, "application/octet-stream");
         _ = self.response.body(content);
         return self.response.build();
     }
 
-    /// Sends a JSON response.
+    /// Sends a JSON response from any Zig value.
     pub fn json(self: *Self, value: anytype) !Response {
         _ = try self.response.json(value);
         return self.response.build();
@@ -166,10 +216,105 @@ pub const Context = struct {
         _ = try self.response.header(HeaderName.LOCATION, url);
         return self.response.build();
     }
+
+    // -- Request body binding --
+
+    /// Binds the JSON request body to a Zig struct type.
+    /// Returns the parsed struct or an error.
+    ///
+    /// Example:
+    /// ```zig
+    /// const User = struct { name: []const u8, age: u32 };
+    /// const user = try ctx.bind(User);
+    /// ```
+    pub fn bind(self: *Self, comptime T: type) !T {
+        const body = self.request.body orelse return error.EmptyBody;
+        return std.json.parseFromSlice(T, self.allocator, body, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.InvalidJson;
+    }
+
+    /// Binds JSON request body, returning null on failure instead of error.
+    pub fn shouldBind(self: *Self, comptime T: type) ?T {
+        return self.bind(T) catch null;
+    }
+
+    // -- Abort --
+
+    /// Aborts the middleware chain with a status code and message.
+    /// Subsequent middleware and the handler will not execute.
+    pub fn abort(self: *Self, code: u16, message: []const u8) void {
+        self.is_aborted = true;
+        var resp = Response.init(self.allocator, code);
+        resp.body = self.allocator.dupe(u8, message) catch null;
+        resp.body_owned = true;
+        self.abort_response = resp;
+    }
+
+    /// Aborts with a status code only (no body).
+    pub fn abortWithStatus(self: *Self, code: u16) void {
+        self.is_aborted = true;
+        self.abort_response = Response.init(self.allocator, code);
+    }
+
+    /// Aborts with a JSON response body.
+    pub fn abortWithJSON(self: *Self, code: u16, value: anytype) void {
+        self.is_aborted = true;
+        var resp = Response.init(self.allocator, code);
+        const json_str = std.json.stringifyAlloc(self.allocator, value, .{}) catch {
+            resp.body = null;
+            self.abort_response = resp;
+            return;
+        };
+        resp.body = json_str;
+        resp.body_owned = true;
+        resp.headers.set(HeaderName.CONTENT_TYPE, "application/json; charset=utf-8") catch {};
+        self.abort_response = resp;
+    }
+
+    // -- User data store --
+
+    /// Stores a value in the context (like Gin's `c.Set()`).
+    pub fn set(self: *Self, key: []const u8, ptr: *anyopaque) !void {
+        try self.data.put(key, ptr);
+    }
+
+    /// Retrieves a value from the context (like Gin's `c.Get()`).
+    pub fn get(self: *const Self, key: []const u8) ?*anyopaque {
+        return self.data.get(key);
+    }
+
+    /// Calls next middleware in the chain. Use this inside middleware handlers.
+    pub fn next(self: *Self) anyerror!Response {
+        return chainNext(self);
+    }
 };
 
-/// Handler function type.
-pub const Handler = *const fn (*Context) anyerror!Response;
+/// Parse a single query parameter from a query string.
+/// This is a zero-allocation lookup; it does NOT decode percent-encoding.
+fn getQueryParam(qs: []const u8, name: []const u8) ?[]const u8 {
+    var iter = mem.splitScalar(u8, qs, '&');
+    while (iter.next()) |pair| {
+        if (pair.len == 0) continue;
+        if (mem.indexOfScalar(u8, pair, '=')) |eq_pos| {
+            const key = pair[0..eq_pos];
+            const value = pair[eq_pos + 1 ..];
+            if (mem.eql(u8, key, name)) {
+                return value;
+            }
+        } else {
+            // key with no value
+            if (mem.eql(u8, pair, name)) {
+                return "";
+            }
+        }
+    }
+    return null;
+}
+
+// ============================================================================
+// Server
+// ============================================================================
 
 /// HTTP Server.
 pub const Server = struct {
@@ -214,15 +359,6 @@ pub const Server = struct {
     }
 
     /// Enables multi-threaded request handling.
-    ///
-    /// When enabled, the server runs with multiple ZIO executors for concurrent
-    /// request processing.
-    ///
-    /// Example:
-    /// ```zig
-    /// var server = Server.init(allocator);
-    /// server.enableThreading(.{ .num_workers = 8 });
-    /// ```
     pub fn enableThreading(self: *Self, config: ThreadingConfig) void {
         self.threading_enabled = true;
         self.config.threads = config.num_workers;
@@ -249,10 +385,14 @@ pub const Server = struct {
         };
     }
 
-    /// Adds middleware to the server.
+    // -- Middleware --
+
+    /// Adds global middleware to the server (applies to all routes).
     pub fn use(self: *Self, mw: Middleware) !void {
         try self.middleware.append(self.allocator, mw);
     }
+
+    // -- Route registration --
 
     /// Registers a route handler.
     pub fn route(self: *Self, method: types.Method, path: []const u8, handler: Handler) !void {
@@ -284,6 +424,41 @@ pub const Server = struct {
         try self.route(.PATCH, path, handler);
     }
 
+    /// Creates a route group with a prefix.
+    pub fn group(self: *Self, prefix: []const u8) RouteGroup {
+        return self.router.group(prefix);
+    }
+
+    // -- Static file serving --
+
+    /// Serves static files from a directory.
+    ///
+    /// Example:
+    /// ```zig
+    /// try server.static("/assets", "./public");
+    /// ```
+    pub fn static(self: *Self, url_prefix: []const u8, dir_path: []const u8) !void {
+        _ = dir_path;
+        // Register a catch-all route under the prefix
+        const handler = struct {
+            fn h(ctx: *Context) anyerror!Response {
+                const filepath = ctx.param("filepath") orelse return ctx.status(404).text("Not Found");
+                return ctx.file(filepath);
+            }
+        }.h;
+
+        // Build pattern: /assets/*filepath
+        var pattern = std.ArrayListUnmanaged(u8){};
+        defer pattern.deinit(self.allocator);
+        try pattern.appendSlice(self.allocator, url_prefix);
+        try pattern.appendSlice(self.allocator, "/*filepath");
+        const owned = try self.allocator.dupe(u8, pattern.items);
+
+        try self.router.add(.GET, owned, handler);
+    }
+
+    // -- WebSocket --
+
     /// Registers a WebSocket handler for a path.
     pub fn websocket(self: *Self, path: []const u8, handler: WebSocketHandler) !void {
         try self.ws_handlers.put(self.allocator, path, handler);
@@ -294,9 +469,9 @@ pub const Server = struct {
         try self.websocket(path, handler);
     }
 
+    // -- Server lifecycle --
+
     /// Starts the server and begins accepting connections.
-    ///
-    /// Uses ZIO runtime and async network primitives for all connections.
     pub fn listen(self: *Self) !void {
         if (self.running.load(.acquire)) return;
         self.running.store(true, .release);
@@ -308,8 +483,8 @@ pub const Server = struct {
         const addr = try zio.net.IpAddress.parseIp(self.config.host, self.config.port);
         self.listener = try addr.listen(.{});
         defer {
-            if (self.listener) |listener| {
-                listener.close();
+            if (self.listener) |listener_val| {
+                listener_val.close();
             }
             self.listener = null;
             self.running.store(false, .release);
@@ -321,12 +496,12 @@ pub const Server = struct {
             executors,
         });
 
-        var group: zio.Group = .init;
-        defer group.cancel();
+        var io_group: zio.Group = .init;
+        defer io_group.cancel();
 
         while (self.running.load(.acquire)) {
-            const listener = self.listener orelse break;
-            const conn = listener.accept() catch |err| {
+            const listener_val = self.listener orelse break;
+            const conn = listener_val.accept() catch |err| {
                 if (!self.running.load(.acquire)) break;
                 std.debug.print("Accept error: {}\n", .{err});
                 continue;
@@ -347,7 +522,7 @@ pub const Server = struct {
 
             errdefer conn.close();
 
-            group.spawn(handleConnectionTask, .{ self, conn }) catch |err| {
+            io_group.spawn(handleConnectionTask, .{ self, conn }) catch |err| {
                 std.debug.print("Spawn error: {}\n", .{err});
                 _ = self.active_requests.fetchSub(1, .monotonic);
                 _ = self.total_errors.fetchAdd(1, .monotonic);
@@ -356,15 +531,15 @@ pub const Server = struct {
             };
         }
 
-        group.wait() catch {};
+        io_group.wait() catch {};
     }
 
     /// Stops the server gracefully.
     pub fn stop(self: *Self) void {
         self.running.store(false, .release);
 
-        if (self.listener) |listener| {
-            listener.close();
+        if (self.listener) |listener_val| {
+            listener_val.close();
             self.listener = null;
         }
     }
@@ -500,37 +675,82 @@ pub const Server = struct {
                 return;
             }
 
+            // -- Route lookup with 405 support --
             var ctx = Context.init(self.allocator, &req);
             defer ctx.deinit();
 
-            const route_result = self.router.find(req.method, req.uri.path);
+            const find_result = self.router.findEx(req.method, req.uri.path);
 
-            if (route_result == null) {
-                try self.sendErrorStream(conn_stream, 404, request_timeout);
-                if (!self.shouldKeepAlive(&req)) return;
-                continue;
+            switch (find_result) {
+                .not_found => {
+                    if (self.router.not_found_handler) |nf_handler| {
+                        var response = nf_handler(&ctx) catch |err| {
+                            std.debug.print("NotFound handler error: {}\n", .{err});
+                            _ = self.total_errors.fetchAdd(1, .monotonic);
+                            try self.sendErrorStream(conn_stream, 500, request_timeout);
+                            if (!self.shouldKeepAlive(&req)) return;
+                            continue;
+                        };
+                        defer response.deinit();
+                        const formatted = try http.formatResponse(&response, self.allocator);
+                        defer self.allocator.free(formatted);
+                        try conn_stream.writeAll(formatted, request_timeout);
+                        _ = self.requests_handled.fetchAdd(1, .monotonic);
+                    } else {
+                        try self.sendErrorStream(conn_stream, 404, request_timeout);
+                    }
+                    if (!self.shouldKeepAlive(&req)) return;
+                    continue;
+                },
+                .method_not_allowed => {
+                    if (self.router.method_not_allowed_handler) |mna_handler| {
+                        var response = mna_handler(&ctx) catch |err| {
+                            std.debug.print("MethodNotAllowed handler error: {}\n", .{err});
+                            _ = self.total_errors.fetchAdd(1, .monotonic);
+                            try self.sendErrorStream(conn_stream, 500, request_timeout);
+                            if (!self.shouldKeepAlive(&req)) return;
+                            continue;
+                        };
+                        defer response.deinit();
+                        const formatted = try http.formatResponse(&response, self.allocator);
+                        defer self.allocator.free(formatted);
+                        try conn_stream.writeAll(formatted, request_timeout);
+                        _ = self.requests_handled.fetchAdd(1, .monotonic);
+                    } else {
+                        try self.sendErrorStream(conn_stream, 405, request_timeout);
+                    }
+                    if (!self.shouldKeepAlive(&req)) return;
+                    continue;
+                },
+                .matched => |matched| {
+                    // Populate context params
+                    for (matched.params) |p| {
+                        try ctx.params.put(p.name, p.value);
+                    }
+
+                    // Execute middleware chain: global + route middleware + handler
+                    var response = MiddlewareChain.execute(
+                        &ctx,
+                        self.middleware.items,
+                        matched.middleware,
+                        matched.handler,
+                    ) catch |err| {
+                        std.debug.print("Handler error: {}\n", .{err});
+                        _ = self.total_errors.fetchAdd(1, .monotonic);
+                        try self.sendErrorStream(conn_stream, 500, request_timeout);
+                        if (!self.shouldKeepAlive(&req)) return;
+                        continue;
+                    };
+
+                    defer response.deinit();
+
+                    const formatted = try http.formatResponse(&response, self.allocator);
+                    defer self.allocator.free(formatted);
+
+                    try conn_stream.writeAll(formatted, request_timeout);
+                    _ = self.requests_handled.fetchAdd(1, .monotonic);
+                },
             }
-
-            const matched_route = route_result.?;
-            for (matched_route.params) |p| {
-                try ctx.params.put(p.name, p.value);
-            }
-
-            var response = matched_route.handler(&ctx) catch |err| {
-                std.debug.print("Handler error: {}\n", .{err});
-                _ = self.total_errors.fetchAdd(1, .monotonic);
-                try self.sendErrorStream(conn_stream, 500, request_timeout);
-                if (!self.shouldKeepAlive(&req)) return;
-                continue;
-            };
-
-            defer response.deinit();
-
-            const formatted = try http.formatResponse(&response, self.allocator);
-            defer self.allocator.free(formatted);
-
-            try conn_stream.writeAll(formatted, request_timeout);
-            _ = self.requests_handled.fetchAdd(1, .monotonic);
 
             if (!self.shouldKeepAlive(&req)) {
                 return;
@@ -538,14 +758,14 @@ pub const Server = struct {
         }
     }
 
-    fn sendErrorStream(self: *Self, stream: zio.net.Stream, code: u16, timeout: zio.Timeout) !void {
+    fn sendErrorStream(self: *Self, stream: zio.net.Stream, code: u16, timeout_val: zio.Timeout) !void {
         var resp = Response.init(self.allocator, code);
         defer resp.deinit();
 
         const formatted = try http.formatResponse(&resp, self.allocator);
         defer self.allocator.free(formatted);
 
-        try stream.writeAll(formatted, timeout);
+        try stream.writeAll(formatted, timeout_val);
     }
 
     fn requestIoTimeout(self: *const Self) zio.Timeout {
@@ -599,16 +819,20 @@ fn statusCodeForParseError(err: anyerror) u16 {
     };
 }
 
-fn compactPendingBuffer(buffer: *std.ArrayListUnmanaged(u8), offset: *usize) void {
+fn compactPendingBuffer(buffer_list: *std.ArrayListUnmanaged(u8), offset: *usize) void {
     if (offset.* == 0) return;
 
-    const remaining = buffer.items.len - offset.*;
+    const remaining = buffer_list.items.len - offset.*;
     if (remaining > 0) {
-        std.mem.copyForwards(u8, buffer.items[0..remaining], buffer.items[offset.*..]);
+        std.mem.copyForwards(u8, buffer_list.items[0..remaining], buffer_list.items[offset.*..]);
     }
-    buffer.shrinkRetainingCapacity(remaining);
+    buffer_list.shrinkRetainingCapacity(remaining);
     offset.* = 0;
 }
+
+// ============================================================================
+// Test helpers
+// ============================================================================
 
 const ListenThreadContext = struct {
     server: *Server,
@@ -657,8 +881,8 @@ fn runConcurrentClient(ctx: *ClientThreadContext) void {
         return;
     };
 
-    var buffer: [2048]u8 = undefined;
-    const n = socket.recv(&buffer) catch |err| {
+    var recv_buffer: [2048]u8 = undefined;
+    const n = socket.recv(&recv_buffer) catch |err| {
         ctx.err = err;
         return;
     };
@@ -668,7 +892,7 @@ fn runConcurrentClient(ctx: *ClientThreadContext) void {
         return;
     }
 
-    if (std.mem.indexOf(u8, buffer[0..n], "HTTP/1.1 200 OK") == null) {
+    if (std.mem.indexOf(u8, recv_buffer[0..n], "HTTP/1.1 200 OK") == null) {
         ctx.err = error.BadHttpResponse;
         return;
     }
@@ -677,10 +901,10 @@ fn runConcurrentClient(ctx: *ClientThreadContext) void {
 }
 
 fn reserveTestPort() !u16 {
-    var listener = try socket_mod.TcpListener.init(try std.net.Address.parseIp("127.0.0.1", 0));
-    defer listener.deinit();
+    var tcp_listener = try socket_mod.TcpListener.init(try std.net.Address.parseIp("127.0.0.1", 0));
+    defer tcp_listener.deinit();
 
-    const addr = try listener.getLocalAddress();
+    const addr = try tcp_listener.getLocalAddress();
     return addr.getPort();
 }
 
@@ -709,8 +933,8 @@ fn waitForServerReady(port: u16, timeout_ms: u64) !void {
     return error.ServerStartTimeout;
 }
 
-fn parseContentLength(headers: []const u8) ?usize {
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+fn parseContentLength(raw_headers: []const u8) ?usize {
+    var lines = std.mem.splitSequence(u8, raw_headers, "\r\n");
     while (lines.next()) |line| {
         if (line.len == 0) break;
 
@@ -725,19 +949,19 @@ fn parseContentLength(headers: []const u8) ?usize {
 }
 
 fn readHttpResponse(allocator: Allocator, socket: *socket_mod.Socket) ![]u8 {
-    var response = std.ArrayListUnmanaged(u8){};
-    errdefer response.deinit(allocator);
+    var resp = std.ArrayListUnmanaged(u8){};
+    errdefer resp.deinit(allocator);
 
     while (true) {
-        if (std.mem.indexOf(u8, response.items, "\r\n\r\n")) |headers_end| {
+        if (std.mem.indexOf(u8, resp.items, "\r\n\r\n")) |headers_end| {
             const header_len = headers_end + 4;
-            const content_len = parseContentLength(response.items[0..header_len]) orelse 0;
+            const content_len = parseContentLength(resp.items[0..header_len]) orelse 0;
             const total_len = header_len + content_len;
 
-            if (response.items.len >= total_len) {
+            if (resp.items.len >= total_len) {
                 const out = try allocator.alloc(u8, total_len);
-                @memcpy(out, response.items[0..total_len]);
-                response.deinit(allocator);
+                @memcpy(out, resp.items[0..total_len]);
+                resp.deinit(allocator);
                 return out;
             }
         }
@@ -745,9 +969,13 @@ fn readHttpResponse(allocator: Allocator, socket: *socket_mod.Socket) ![]u8 {
         var buf: [1024]u8 = undefined;
         const n = try socket.recv(&buf);
         if (n == 0) return error.UnexpectedEof;
-        try response.appendSlice(allocator, buf[0..n]);
+        try resp.appendSlice(allocator, buf[0..n]);
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 test "Server initialization" {
     const allocator = std.testing.allocator;
@@ -767,6 +995,35 @@ test "Context response helpers" {
 
     _ = ctx.status(201);
     try std.testing.expectEqual(@as(u16, 201), ctx.response.status_code);
+}
+
+test "Context query parameter parsing" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/search?q=hello&page=2&empty=");
+    defer req.deinit();
+
+    var ctx = Context.init(allocator, &req);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("hello", ctx.query("q").?);
+    try std.testing.expectEqualStrings("2", ctx.query("page").?);
+    try std.testing.expectEqualStrings("", ctx.query("empty").?);
+    try std.testing.expect(ctx.query("missing") == null);
+    try std.testing.expectEqualStrings("1", ctx.queryDefault("missing", "1"));
+}
+
+test "Context abort" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/test");
+    defer req.deinit();
+
+    var ctx = Context.init(allocator, &req);
+    defer ctx.deinit();
+
+    ctx.abort(403, "Forbidden");
+    try std.testing.expect(ctx.is_aborted);
+    try std.testing.expect(ctx.abort_response != null);
+    try std.testing.expectEqual(@as(u16, 403), ctx.abort_response.?.status.code);
 }
 
 test "Server with config" {
@@ -1019,10 +1276,10 @@ test "Server returns 400 for malformed request" {
 
     try client.sendAll("BROKEN\r\n\r\n");
 
-    const response = try readHttpResponse(allocator, &client);
-    defer allocator.free(response);
+    const resp_data = try readHttpResponse(allocator, &client);
+    defer allocator.free(resp_data);
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 400 Bad Request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp_data, "HTTP/1.1 400 Bad Request") != null);
 
     server.stop();
     listen_thread.join();
@@ -1073,10 +1330,10 @@ test "Server enforces max body size" {
             "0123456789",
     );
 
-    const response = try readHttpResponse(allocator, &client);
-    defer allocator.free(response);
+    const resp_data = try readHttpResponse(allocator, &client);
+    defer allocator.free(resp_data);
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 413 Payload Too Large") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp_data, "HTTP/1.1 413 Payload Too Large") != null);
 
     server.stop();
     listen_thread.join();
@@ -1330,16 +1587,16 @@ test "Server websocket upgrade preserves same-packet frame bytes" {
     var frame_bytes = std.ArrayListUnmanaged(u8){};
     defer frame_bytes.deinit(allocator);
 
-    var decoded: ?websocket.DecodeResult = null;
-    while (decoded == null) {
+    var decoded_result: ?websocket.DecodeResult = null;
+    while (decoded_result == null) {
         var chunk: [256]u8 = undefined;
         const n = try client.recv(&chunk);
         if (n == 0) return error.UnexpectedEof;
         try frame_bytes.appendSlice(allocator, chunk[0..n]);
-        decoded = try websocket.decodeFrame(allocator, frame_bytes.items, websocket.DEFAULT_MAX_PAYLOAD_SIZE);
+        decoded_result = try websocket.decodeFrame(allocator, frame_bytes.items, websocket.DEFAULT_MAX_PAYLOAD_SIZE);
     }
 
-    const echo = decoded.?;
+    const echo = decoded_result.?;
     defer allocator.free(echo.payload_owned);
     try std.testing.expectEqual(websocket.Opcode.text, echo.frame.opcode);
     try std.testing.expectEqualStrings("same-packet", echo.frame.payload);

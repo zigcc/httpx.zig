@@ -25,7 +25,7 @@ pub fn init() !void {
     try router.add(.GET, "/posts", dummyHandler);
     try router.add(.GET, "/posts/:id", dummyHandler);
     try router.add(.GET, "/api/v1/users/:userId/posts/:postId/comments", dummyHandler);
-    try router.add(.GET, "/static/*", dummyHandler);
+    try router.add(.GET, "/static/*filepath", dummyHandler);
 }
 
 pub fn deinit() void {

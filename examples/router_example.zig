@@ -26,7 +26,7 @@ pub fn main() !void {
     try router.add(.POST, "/users", indexHandler);
     try router.add(.PUT, "/users/:id", indexHandler);
     try router.add(.DELETE, "/users/:id", indexHandler);
-    try router.add(.GET, "/static/*", indexHandler);
+    try router.add(.GET, "/static/*filepath", indexHandler);
 
     std.debug.print("Registered Routes:\n", .{});
     std.debug.print("  GET    /\n", .{});
@@ -36,7 +36,7 @@ pub fn main() !void {
     std.debug.print("  POST   /users\n", .{});
     std.debug.print("  PUT    /users/:id\n", .{});
     std.debug.print("  DELETE /users/:id\n", .{});
-    std.debug.print("  GET    /static/*\n", .{});
+    std.debug.print("  GET    /static/*filepath\n", .{});
 
     std.debug.print("\nRoute Matching Tests:\n", .{});
 
