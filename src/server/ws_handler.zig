@@ -30,6 +30,7 @@ const Allocator = mem.Allocator;
 const zio = @import("zio");
 
 const ws = @import("../protocol/websocket.zig");
+const tls_server = @import("../tls/server.zig");
 const HttpError = @import("../core/types.zig").HttpError;
 const Socket = @import("../net/socket.zig").Socket;
 const Headers = @import("../core/headers.zig").Headers;
@@ -71,6 +72,7 @@ pub const WebSocketConnection = struct {
     const Transport = union(enum) {
         socket: Socket,
         stream: zio.net.Stream,
+        tls_stream: *tls_server.TlsServer(zio.net.Stream),
     };
 
     /// Creates a new WebSocket connection from an accepted socket.
@@ -93,6 +95,16 @@ pub const WebSocketConnection = struct {
         };
     }
 
+    /// Creates a new WebSocket connection over a TLS stream.
+    pub fn initTlsStream(allocator: Allocator, tls_stream: *tls_server.TlsServer(zio.net.Stream)) Self {
+        return .{
+            .allocator = allocator,
+            .transport = .{ .tls_stream = tls_stream },
+            .state = .open,
+            .frame_reader = ws.FrameReader.initServer(allocator),
+        };
+    }
+
     /// Releases connection resources.
     pub fn deinit(self: *Self) void {
         self.frame_reader.deinit();
@@ -100,6 +112,7 @@ pub const WebSocketConnection = struct {
         switch (self.transport) {
             .socket => |*sock| sock.close(),
             .stream => |stream| stream.close(),
+            .tls_stream => |tls_stream| tls_stream.close(),
         }
     }
 
@@ -239,6 +252,7 @@ pub const WebSocketConnection = struct {
         switch (self.transport) {
             .socket => |*sock| try sock.sendAll(data),
             .stream => |stream| try stream.writeAll(data, .none),
+            .tls_stream => |tls_stream| try tls_stream.writeAll(data),
         }
     }
 
@@ -246,6 +260,7 @@ pub const WebSocketConnection = struct {
         return switch (self.transport) {
             .socket => |*sock| sock.recv(buffer),
             .stream => |stream| stream.read(buffer, .none),
+            .tls_stream => |tls_stream| tls_stream.read(buffer),
         };
     }
 
@@ -329,6 +344,7 @@ pub fn generateUpgradeResponse(allocator: Allocator, request: *const Request, pr
     // Validate protocol against CRLF injection
     if (protocol) |p| {
         if (containsCrlf(p)) return error.InvalidProtocol;
+        if (!isRequestedSubprotocol(request, p)) return error.InvalidProtocol;
     }
 
     const accept = ws.computeAccept(key);
@@ -390,6 +406,24 @@ pub fn acceptUpgradeStream(
     return WebSocketConnection.initStream(allocator, stream);
 }
 
+/// Performs the server-side WebSocket handshake over a TLS stream.
+pub fn acceptUpgradeTlsStream(
+    allocator: Allocator,
+    tls_stream: *tls_server.TlsServer(zio.net.Stream),
+    request: *const Request,
+    protocol: ?[]const u8,
+) !WebSocketConnection {
+    if (!isUpgradeRequest(request)) {
+        return error.NotWebSocketRequest;
+    }
+
+    const response = try generateUpgradeResponse(allocator, request, protocol);
+    defer allocator.free(response);
+
+    try tls_stream.writeAll(response);
+    return WebSocketConnection.initTlsStream(allocator, tls_stream);
+}
+
 /// Case-insensitive ASCII string comparison.
 fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
@@ -397,6 +431,17 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
         if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
     }
     return true;
+}
+
+fn isRequestedSubprotocol(request: *const Request, protocol: []const u8) bool {
+    const offered = request.headers.get(HeaderName.SEC_WEBSOCKET_PROTOCOL) orelse return false;
+
+    var iter = mem.splitScalar(u8, offered, ',');
+    while (iter.next()) |part| {
+        const token = mem.trim(u8, part, " \t");
+        if (mem.eql(u8, token, protocol)) return true;
+    }
+    return false;
 }
 
 test "isUpgradeRequest detection" {
@@ -528,11 +573,25 @@ test "generateUpgradeResponse with protocol" {
     defer req.deinit();
 
     try req.headers.set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    try req.headers.set("Sec-WebSocket-Protocol", "chat.v1, chat.v2");
 
     const response = try generateUpgradeResponse(allocator, &req, "chat.v1");
     defer allocator.free(response);
 
     try std.testing.expect(mem.indexOf(u8, response, "Sec-WebSocket-Protocol: chat.v1\r\n") != null);
+}
+
+test "generateUpgradeResponse rejects protocol not offered by client" {
+    const allocator = std.testing.allocator;
+
+    var req = try Request.init(allocator, .GET, "/chat");
+    defer req.deinit();
+
+    try req.headers.set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    try req.headers.set("Sec-WebSocket-Protocol", "chat.v1, chat.v2");
+
+    const result = generateUpgradeResponse(allocator, &req, "chat.v3");
+    try std.testing.expectError(error.InvalidProtocol, result);
 }
 
 test "generateUpgradeResponse missing key" {

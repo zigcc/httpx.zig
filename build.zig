@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "http2_example", .path = "examples/http2_example.zig" },
         .{ .name = "http3_example", .path = "examples/http3_example.zig" },
         .{ .name = "websocket_server", .path = "examples/websocket_server.zig", .skip_run_all = true },
+        .{ .name = "https_wss_pem", .path = "examples/https_wss_pem.zig", .skip_run_all = true },
         .{ .name = "threaded_server", .path = "examples/threaded_server.zig", .skip_run_all = true },
     };
 

@@ -40,9 +40,12 @@ pub const FindResult = union(enum) {
         handler: Handler,
         params: []const RouteParam,
         middleware: []const Middleware,
+        full_pattern: ?[]const u8 = null,
     },
     method_not_allowed: void,
     not_found: void,
+    /// The path was found with/without a trailing slash; server should redirect.
+    trailing_slash_redirect: void,
 };
 
 // ============================================================================
@@ -65,6 +68,8 @@ const Node = struct {
 
     /// Handler registered at this node (null if this is an intermediate node).
     handler: ?Handler = null,
+    /// The full route pattern (e.g., "/users/:id") for introspection.
+    full_pattern: ?[]const u8 = null,
     /// Middleware chain for this route (from groups).
     route_middleware: std.ArrayListUnmanaged(Middleware) = .empty,
 
@@ -103,7 +108,7 @@ const Node = struct {
     }
 
     /// Insert a route into the radix tree.
-    fn addRoute(self: *Node, allocator: Allocator, path: []const u8, handler: Handler, mw: []const Middleware) !void {
+    fn addRoute(self: *Node, allocator: Allocator, path: []const u8, handler: Handler, mw: []const Middleware, pattern: []const u8) !void {
         var current = self;
         var remaining = path;
 
@@ -131,12 +136,20 @@ const Node = struct {
             // Check for catch-all segment
             if (remaining[0] == '*') {
                 const wildcard_name = if (remaining.len > 1) remaining[1..] else "filepath";
+
+                // Free existing catch-all child if being replaced
+                if (current.catch_all_child) |old| {
+                    old.deinit(allocator);
+                    allocator.destroy(old);
+                }
+
                 const child = try allocator.create(Node);
                 child.* = .{
                     .path = remaining,
                     .node_type = .catch_all,
                     .wildcard_name = wildcard_name,
                     .handler = handler,
+                    .full_pattern = pattern,
                 };
                 try child.route_middleware.appendSlice(allocator, mw);
                 current.catch_all_child = child;
@@ -161,6 +174,7 @@ const Node = struct {
                 } else {
                     // Exact match on this node
                     current.children.items[i].handler = handler;
+                    current.children.items[i].full_pattern = pattern;
                     try current.children.items[i].route_middleware.appendSlice(allocator, mw);
                     return;
                 }
@@ -171,6 +185,7 @@ const Node = struct {
                     .path = remaining,
                     .node_type = .static,
                     .handler = handler,
+                    .full_pattern = pattern,
                 };
                 try child.route_middleware.appendSlice(allocator, mw);
                 try current.children.append(allocator, child);
@@ -181,6 +196,7 @@ const Node = struct {
 
         // We consumed the entire path and landed on `current`
         current.handler = handler;
+        current.full_pattern = pattern;
         try current.route_middleware.appendSlice(allocator, mw);
     }
 
@@ -209,6 +225,7 @@ const Node = struct {
                     return .{
                         .handler = h,
                         .middleware = current.route_middleware.items,
+                        .full_pattern = current.full_pattern,
                     };
                 }
                 return null;
@@ -261,6 +278,7 @@ const Node = struct {
                     return .{
                         .handler = h,
                         .middleware = catch_node.route_middleware.items,
+                        .full_pattern = catch_node.full_pattern,
                     };
                 }
                 return null;
@@ -319,6 +337,7 @@ const Node = struct {
 const LookupResult = struct {
     handler: Handler,
     middleware: []const Middleware,
+    full_pattern: ?[]const u8 = null,
 };
 
 /// Split a static node at `pos` characters.
@@ -351,7 +370,7 @@ fn commonPrefixLen(a: []const u8, b: []const u8) usize {
     return i;
 }
 
-const MAX_PARAMS = 16;
+pub const MAX_PARAMS = 16;
 
 // ============================================================================
 // Method Trees — one radix tree per HTTP method
@@ -389,6 +408,15 @@ pub const Router = struct {
     not_found_handler: ?Handler = null,
     method_not_allowed_handler: ?Handler = null,
     global_middleware: std.ArrayListUnmanaged(Middleware) = .empty,
+    /// Owned path strings from route groups and static routes that need freeing.
+    owned_paths: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    /// If true, the router will redirect /path/ to /path (or vice versa) with 301.
+    redirect_trailing_slash: bool = true,
+    /// If true, HEAD requests fall back to the GET handler when no HEAD handler exists.
+    handle_head_to_get: bool = true,
+    /// If true, the router auto-responds to OPTIONS requests with allowed methods.
+    handle_options_auto: bool = true,
 
     const Self = @This();
 
@@ -407,6 +435,15 @@ pub const Router = struct {
             }
         }
         self.global_middleware.deinit(self.allocator);
+        for (self.owned_paths.items) |p| {
+            self.allocator.free(p);
+        }
+        self.owned_paths.deinit(self.allocator);
+    }
+
+    /// Tracks an owned path string for cleanup on deinit.
+    pub fn trackOwnedPath(self: *Self, path: []const u8) !void {
+        try self.owned_paths.append(self.allocator, path);
     }
 
     /// Adds a route to the router.
@@ -422,18 +459,17 @@ pub const Router = struct {
             root.* = .{};
             self.trees[idx] = root;
         }
-        try self.trees[idx].?.addRoute(self.allocator, pattern, handler, mw);
+        try self.trees[idx].?.addRoute(self.allocator, pattern, handler, mw, pattern);
     }
 
     /// Finds a matching route for the given method and path.
-    /// Returns a struct compatible with the old API for backward compatibility.
-    pub fn find(self: *Self, method: types.Method, path: []const u8) ?struct { handler: Handler, params: []const RouteParam } {
-        var params_buf: [MAX_PARAMS]RouteParam = undefined;
+    /// The caller must provide a `params_buf` that outlives the returned slice.
+    pub fn find(self: *Self, method: types.Method, path: []const u8, params_buf: *[MAX_PARAMS]RouteParam) ?struct { handler: Handler, params: []const RouteParam } {
         var param_count: usize = 0;
 
         const idx = methodIndex(method);
         if (self.trees[idx]) |root| {
-            if (root.lookup(path, &params_buf, &param_count)) |result| {
+            if (root.lookup(path, params_buf, &param_count)) |result| {
                 return .{
                     .handler = result.handler,
                     .params = params_buf[0..param_count],
@@ -445,32 +481,142 @@ pub const Router = struct {
 
     /// Extended find that distinguishes not_found vs method_not_allowed,
     /// and returns associated route middleware.
-    pub fn findEx(self: *Self, method: types.Method, path: []const u8) FindResult {
-        var params_buf: [MAX_PARAMS]RouteParam = undefined;
+    /// Also handles HEAD->GET fallback, trailing slash redirect, and OPTIONS auto-response.
+    /// The caller must provide a `params_buf` that outlives the returned slice.
+    pub fn findEx(self: *Self, method: types.Method, path: []const u8, params_buf: *[MAX_PARAMS]RouteParam) FindResult {
         var param_count: usize = 0;
 
         const idx = methodIndex(method);
         if (self.trees[idx]) |root| {
-            if (root.lookup(path, &params_buf, &param_count)) |result| {
+            if (root.lookup(path, params_buf, &param_count)) |result| {
                 return .{ .matched = .{
                     .handler = result.handler,
                     .params = params_buf[0..param_count],
                     .middleware = result.middleware,
+                    .full_pattern = result.full_pattern,
                 } };
             }
         }
 
-        // Path not matched on this method — check if other methods handle it
-        for (self.trees, 0..) |tree_opt, i| {
-            if (i == idx) continue;
-            if (tree_opt) |root| {
-                if (root.pathExists(path)) {
-                    return .method_not_allowed;
+        // HEAD -> GET fallback
+        if (self.handle_head_to_get and method == .HEAD) {
+            const get_idx = methodIndex(.GET);
+            if (self.trees[get_idx]) |root| {
+                param_count = 0;
+                if (root.lookup(path, params_buf, &param_count)) |result| {
+                    return .{ .matched = .{
+                        .handler = result.handler,
+                        .params = params_buf[0..param_count],
+                        .middleware = result.middleware,
+                        .full_pattern = result.full_pattern,
+                    } };
                 }
             }
         }
 
+        // Trailing slash redirect: try with/without trailing slash
+        if (self.redirect_trailing_slash and path.len > 1) {
+            if (self.tryTrailingSlashRedirect(method, path)) {
+                return .trailing_slash_redirect;
+            }
+        }
+
+        // Path not matched on this method — check if other methods handle it
+        var has_other_methods = false;
+        for (self.trees, 0..) |tree_opt, i| {
+            if (i == idx) continue;
+            if (tree_opt) |root| {
+                if (root.pathExists(path)) {
+                    has_other_methods = true;
+                    break;
+                }
+            }
+        }
+
+        if (has_other_methods) {
+            return .method_not_allowed;
+        }
+
         return .not_found;
+    }
+
+    /// Check if the alternate path (with/without trailing slash) has a handler.
+    fn tryTrailingSlashRedirect(self: *Self, method: types.Method, path: []const u8) bool {
+        var params_buf: [MAX_PARAMS]RouteParam = undefined;
+        var param_count: usize = 0;
+
+        // Build the alternate path
+        const has_slash = path[path.len - 1] == '/';
+
+        // We check the method's own tree plus GET (for HEAD fallback)
+        const methods_to_check = if (self.handle_head_to_get and method == .HEAD)
+            &[_]usize{ methodIndex(method), methodIndex(.GET) }
+        else
+            &[_]usize{methodIndex(method)};
+
+        for (methods_to_check) |mi| {
+            if (self.trees[mi]) |root| {
+                if (has_slash) {
+                    // Try without trailing slash
+                    param_count = 0;
+                    if (root.lookup(path[0 .. path.len - 1], &params_buf, &param_count)) |_| {
+                        return true;
+                    }
+                } else {
+                    // Try with trailing slash - build temporary path
+                    // Since we can't easily allocate here, check pathExists for the alternate
+                    // We'll use pathExists which doesn't need params
+                    var alt_buf: [2048]u8 = undefined;
+                    if (path.len < alt_buf.len - 1) {
+                        @memcpy(alt_buf[0..path.len], path);
+                        alt_buf[path.len] = '/';
+                        param_count = 0;
+                        if (root.lookup(alt_buf[0 .. path.len + 1], &params_buf, &param_count)) |_| {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Returns the list of HTTP methods allowed for the given path.
+    pub fn allowedMethods(self: *Self, path: []const u8) [NUM_METHODS]bool {
+        var allowed: [NUM_METHODS]bool = [_]bool{false} ** NUM_METHODS;
+        for (self.trees, 0..) |tree_opt, i| {
+            if (tree_opt) |root| {
+                if (root.pathExists(path)) {
+                    allowed[i] = true;
+                }
+            }
+        }
+        return allowed;
+    }
+
+    /// Formats the allowed methods as a comma-separated string.
+    pub fn formatAllowedMethods(allowed: [NUM_METHODS]bool, buf: *[128]u8) []const u8 {
+        const method_names = [NUM_METHODS][]const u8{
+            "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE", "CUSTOM",
+        };
+        var pos: usize = 0;
+        var first = true;
+        for (0..NUM_METHODS) |i| {
+            if (allowed[i]) {
+                if (!first and pos + 2 < buf.len) {
+                    buf[pos] = ',';
+                    buf[pos + 1] = ' ';
+                    pos += 2;
+                }
+                first = false;
+                const name = method_names[i];
+                if (pos + name.len <= buf.len) {
+                    @memcpy(buf[pos..][0..name.len], name);
+                    pos += name.len;
+                }
+            }
+        }
+        return buf[0..pos];
     }
 
     /// Sets the 404 handler.
@@ -530,6 +676,8 @@ pub const RouteGroup = struct {
         try full_prefix.appendSlice(self.router.allocator, self.prefix);
         try full_prefix.appendSlice(self.router.allocator, prefix);
         const owned = try full_prefix.toOwnedSlice(self.router.allocator);
+        // Track this allocation so the router can free it
+        try self.router.trackOwnedPath(owned);
 
         var sub = RouteGroup{
             .router = self.router,
@@ -550,6 +698,8 @@ pub const RouteGroup = struct {
 
         // We must dupe the path because the radix tree stores slices
         const path_owned = try self.router.allocator.dupe(u8, full_path.items);
+        // Track this allocation so the router can free it
+        try self.router.trackOwnedPath(path_owned);
 
         try self.router.addWithMiddleware(method, path_owned, handler, self.middleware.items);
     }
@@ -599,17 +749,19 @@ test "Router basic matching" {
     try router_inst.add(.GET, "/users/:id", handler);
     try router_inst.add(.POST, "/users", handler);
 
-    const result1 = router_inst.find(.GET, "/users");
+    var pb: [MAX_PARAMS]RouteParam = undefined;
+
+    const result1 = router_inst.find(.GET, "/users", &pb);
     try std.testing.expect(result1 != null);
     try std.testing.expectEqual(@as(usize, 0), result1.?.params.len);
 
-    const result2 = router_inst.find(.GET, "/users/123");
+    const result2 = router_inst.find(.GET, "/users/123", &pb);
     try std.testing.expect(result2 != null);
     try std.testing.expectEqual(@as(usize, 1), result2.?.params.len);
     try std.testing.expectEqualStrings("id", result2.?.params[0].name);
     try std.testing.expectEqualStrings("123", result2.?.params[0].value);
 
-    const result3 = router_inst.find(.DELETE, "/users");
+    const result3 = router_inst.find(.DELETE, "/users", &pb);
     try std.testing.expect(result3 == null);
 }
 
@@ -626,7 +778,8 @@ test "Router multiple parameters" {
 
     try router_inst.add(.GET, "/users/:userId/posts/:postId", handler);
 
-    const result = router_inst.find(.GET, "/users/42/posts/99");
+    var pb: [MAX_PARAMS]RouteParam = undefined;
+    const result = router_inst.find(.GET, "/users/42/posts/99", &pb);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(usize, 2), result.?.params.len);
     try std.testing.expectEqualStrings("userId", result.?.params[0].name);
@@ -648,7 +801,8 @@ test "Router wildcard matching" {
 
     try router_inst.add(.GET, "/static/*filepath", handler);
 
-    const result = router_inst.find(.GET, "/static/css/style.css");
+    var pb: [MAX_PARAMS]RouteParam = undefined;
+    const result = router_inst.find(.GET, "/static/css/style.css", &pb);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(usize, 1), result.?.params.len);
     try std.testing.expectEqualStrings("filepath", result.?.params[0].name);
@@ -669,16 +823,18 @@ test "Router 405 Method Not Allowed detection" {
     try router_inst.add(.GET, "/users", handler);
     try router_inst.add(.POST, "/users", handler);
 
+    var pb: [MAX_PARAMS]RouteParam = undefined;
+
     // DELETE /users should be 405, not 404
-    const result = router_inst.findEx(.DELETE, "/users");
+    const result = router_inst.findEx(.DELETE, "/users", &pb);
     try std.testing.expect(result == .method_not_allowed);
 
     // GET /nonexistent should be 404
-    const result2 = router_inst.findEx(.GET, "/nonexistent");
+    const result2 = router_inst.findEx(.GET, "/nonexistent", &pb);
     try std.testing.expect(result2 == .not_found);
 
     // GET /users should match
-    const result3 = router_inst.findEx(.GET, "/users");
+    const result3 = router_inst.findEx(.GET, "/users", &pb);
     try std.testing.expect(result3 == .matched);
 }
 
@@ -702,11 +858,12 @@ test "Router radix tree prefix sharing" {
     try router_inst.add(.GET, "/api/users", h1);
     try router_inst.add(.GET, "/api/posts", h2);
 
-    const r1 = router_inst.find(.GET, "/api/users");
+    var pb: [MAX_PARAMS]RouteParam = undefined;
+    const r1 = router_inst.find(.GET, "/api/users", &pb);
     try std.testing.expect(r1 != null);
     try std.testing.expect(r1.?.handler == h1);
 
-    const r2 = router_inst.find(.GET, "/api/posts");
+    const r2 = router_inst.find(.GET, "/api/posts", &pb);
     try std.testing.expect(r2 != null);
     try std.testing.expect(r2.?.handler == h2);
 }
@@ -725,7 +882,7 @@ test "Router group with middleware" {
     const dummy_mw = Middleware{
         .name = "test_mw",
         .handler = struct {
-            fn h(_: *Context, _: @import("middleware.zig").Next) anyerror!Response {
+            fn h(_: ?*const anyopaque, _: *Context, _: @import("middleware.zig").Next) anyerror!Response {
                 unreachable;
             }
         }.h,
@@ -736,7 +893,8 @@ test "Router group with middleware" {
     try api.use(dummy_mw);
     try api.get("/users", handler);
 
-    const result = router_inst.findEx(.GET, "/api/v1/users");
+    var pb: [MAX_PARAMS]RouteParam = undefined;
+    const result = router_inst.findEx(.GET, "/api/v1/users", &pb);
     try std.testing.expect(result == .matched);
     try std.testing.expectEqual(@as(usize, 1), result.matched.middleware.len);
     try std.testing.expectEqualStrings("test_mw", result.matched.middleware[0].name);

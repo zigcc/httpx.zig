@@ -56,6 +56,7 @@ pub const address = @import("net/address.zig");
 
 // TLS
 pub const tls = @import("tls/tls.zig");
+pub const tls_server = @import("tls/server.zig");
 pub const tls_session_pool = @import("tls/session_pool.zig");
 
 // Server
@@ -168,10 +169,16 @@ pub const isWebSocketUpgrade = ws_handler.isUpgradeRequest;
 // Server
 pub const Server = server_mod.Server;
 pub const ServerConfig = server_mod.ServerConfig;
+pub const ServerTls12Config = server_mod.Tls12Config;
+pub const ServerTls12PemConfig = server_mod.Tls12PemConfig;
 pub const ThreadingConfig = server_mod.ThreadingConfig;
 pub const RuntimeStats = server_mod.RuntimeStats;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;
+pub const ErrorType = server_mod.ErrorType;
+pub const HandlerError = server_mod.HandlerError;
+pub const formatSSEvent = server_mod.formatSSEvent;
+pub const formatSSEventWithId = server_mod.formatSSEventWithId;
 
 // Router
 pub const Router = router.Router;
@@ -185,15 +192,28 @@ pub const Middleware = middleware.Middleware;
 pub const Next = middleware.Next;
 pub const MiddlewareChain = middleware.MiddlewareChain;
 pub const cors = middleware.cors;
+pub const CorsConfig = middleware.CorsConfig;
 pub const logger = middleware.logger;
 pub const compression = middleware.compression;
 pub const compressionWithConfig = middleware.compressionWithConfig;
 pub const CompressionConfig = middleware.CompressionConfig;
 pub const rateLimit = middleware.rateLimit;
+pub const RateLimitConfig = middleware.RateLimitConfig;
 pub const basicAuth = middleware.basicAuth;
 pub const helmet = middleware.helmet;
 pub const recovery = middleware.recovery;
 pub const recoveryWithWriter = middleware.recoveryWithWriter;
+pub const bodyParser = middleware.bodyParser;
+pub const timeout = middleware.timeout;
+pub const requestId = middleware.requestId;
+pub const conditional = middleware.conditional;
+pub const conditionalWithConfig = middleware.conditionalWithConfig;
+pub const ConditionalConfig = middleware.ConditionalConfig;
+pub const rangeRequest = middleware.rangeRequest;
+pub const rangeRequestWithConfig = middleware.rangeRequestWithConfig;
+pub const RangeConfig = middleware.RangeConfig;
+pub const session = middleware.session;
+pub const SessionConfig = middleware.SessionConfig;
 
 // Buffer utilities
 pub const Buffer = buffer.Buffer;
@@ -208,6 +228,9 @@ pub const PercentEncoding = encoding.PercentEncoding;
 // TLS
 pub const TlsConfig = tls.TlsConfig;
 pub const TlsSession = tls.TlsSession;
+pub const TlsServer = tls_server.TlsServer;
+pub const ServerTlsConfig = tls_server.ServerTlsConfig;
+pub const TlsServerError = tls_server.TlsError;
 pub const TlsSessionPool = tls_session_pool.TlsSessionPool;
 pub const TlsSessionPoolConfig = tls_session_pool.TlsSessionPoolConfig;
 pub const TlsSessionTicket = tls_session_pool.TlsSessionTicket;

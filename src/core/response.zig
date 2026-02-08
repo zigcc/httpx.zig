@@ -72,6 +72,7 @@ pub const ResponseBuilder = struct {
     status_code: u16 = 200,
     headers: Headers,
     body_data: ?[]const u8 = null,
+    body_data_owned: bool = false,
 
     const Self = @This();
 
@@ -85,6 +86,11 @@ pub const ResponseBuilder = struct {
 
     /// Releases builder resources.
     pub fn deinit(self: *Self) void {
+        if (self.body_data_owned) {
+            if (self.body_data) |b| {
+                self.allocator.free(b);
+            }
+        }
         self.headers.deinit();
     }
 
@@ -109,8 +115,15 @@ pub const ResponseBuilder = struct {
     /// Sets a JSON body with appropriate Content-Type.
     pub fn json(self: *Self, value: anytype) !*Self {
         _ = try self.header(HeaderName.CONTENT_TYPE, "application/json");
+        // Free any previously owned body data
+        if (self.body_data_owned) {
+            if (self.body_data) |b| {
+                self.allocator.free(b);
+            }
+        }
         const serialized = try std.json.stringifyAlloc(self.allocator, value, .{});
         self.body_data = serialized;
+        self.body_data_owned = true;
         return self;
     }
 
@@ -137,7 +150,14 @@ pub const ResponseBuilder = struct {
         }
 
         if (self.body_data) |b| {
-            response.body = try self.allocator.dupe(u8, b);
+            if (self.body_data_owned) {
+                // Transfer ownership instead of duplicating
+                response.body = b;
+                self.body_data = null;
+                self.body_data_owned = false;
+            } else {
+                response.body = try self.allocator.dupe(u8, b);
+            }
             response.body_owned = true;
 
             var len_buf: [32]u8 = undefined;

@@ -315,7 +315,19 @@ pub const Parser = struct {
             self.header_count += 1;
 
             if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                self.content_length = std.fmt.parseInt(u64, value, 10) catch null;
+                const parsed_len = std.fmt.parseInt(u64, value, 10) catch {
+                    self.state = .err;
+                    return HttpError.InvalidHeader;
+                };
+
+                if (self.content_length) |existing| {
+                    if (existing != parsed_len) {
+                        self.state = .err;
+                        return HttpError.InvalidHeader;
+                    }
+                }
+
+                self.content_length = parsed_len;
             } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
                 if (mem.indexOf(u8, value, types.TransferEncoding.chunked.toString()) != null) {
                     self.chunked = true;
@@ -611,4 +623,33 @@ test "Parser reset" {
     parser.reset();
     try std.testing.expect(!parser.isComplete());
     try std.testing.expect(parser.method == null);
+}
+
+test "Parser rejects invalid Content-Length" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    const data = "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: nope\r\n\r\n";
+    const result = parser.feed(data);
+
+    try std.testing.expectError(HttpError.InvalidHeader, result);
+    try std.testing.expect(parser.isError());
+}
+
+test "Parser rejects mismatched duplicate Content-Length" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    const data =
+        "POST /upload HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "Content-Length: 7\r\n" ++
+        "\r\n";
+    const result = parser.feed(data);
+
+    try std.testing.expectError(HttpError.InvalidHeader, result);
+    try std.testing.expect(parser.isError());
 }

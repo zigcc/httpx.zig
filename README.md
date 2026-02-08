@@ -84,6 +84,54 @@ The library is structured into several key components:
 - `httpx.Router`: A flexible router for mapping paths to handlers in the server.
 - `httpx.WebSocketConnection`: Server-side WebSocket connection handler.
 
+## HTTPS + WSS with PEM
+
+`httpx.Server` now supports TLS 1.2 directly in the server pipeline, including
+secure WebSocket upgrades (`wss://`).
+
+Use PEM cert/key directly:
+
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var server = httpx.Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = 8443,
+    });
+    defer server.deinit();
+
+    const cert_chain = [_][]const u8{cert_pem};
+    try server.enableTls12Pem(.{
+        .cert_chain_pem = &cert_chain,
+        .private_key_pem = key_pem,
+    });
+
+    try server.get("/", indexHandler);
+    try server.ws("/ws", wsEchoHandler);
+    try server.listen();
+}
+```
+
+Relevant APIs:
+
+- `httpx.ServerTls12Config`
+- `httpx.ServerTls12PemConfig`
+- `server.enableTls12(...)`
+- `server.enableTls12Pem(...)`
+- `server.disableTls()`
+
+Runnable example:
+
+```bash
+zig build run-https_wss_pem
+```
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
